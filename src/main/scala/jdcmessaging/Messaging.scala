@@ -81,22 +81,53 @@ TODO
  *
  */
 
-/** Primary Actor for a SINGLE Messaging instantiation - may have multiple Connections declared **/
-class MessagingActor extends Actor {
+/**
+ * MessagingActor to initiate a SINGLE new Messaging instantiation.
+ *
+ * Regular messages will automatically be chunked/de-chunked by the system, so the application doesn't have
+ * to worry about the size of a message. Very large messages - e.g. a series of chunks intended to transfer
+ * a 4GB file - should be chunked by the Application.
+ *
+ * Each MessagingActor handles one InputStream and one OutputStream, and these should not be touched outside of
+ * that MessagingActor or everything will probably break!
+ *
+ * Within one MessagingActor, multiple Connection IDs may be defined - so that several logical connections can be
+ * multiplexed across the same InputStream/OutputStream. Since each StartConn message also declares the Actor for
+ * the Application, different Actors may be specified for each Connection, or the same Actor for all Connections
+ * (and the Application must then handle the de-multiplexing), or some combination - e.g. one Application Actor
+ * handles N Connections, another Application Actor handles M Connections, etc.
+ *
+ * Only one msgIDGenerator exists for each MessagingActor, so if several Connections are multiplexed the msgID's
+ * within outbound messages will not normally be in sequence for each Connection.
+ *
+ * Each time an outbound Message is sent, an ACK will be sent to ALL Application actors with it's msgID. Comparing
+ * this to the current value of the msgIDGenerator yields the number of outbound messages still in the queue and
+ * allows the Application to throttle if necessary. If the Application is sending messages in chunks, then the
+ * ACK fields on totalData & amtSent also provide information about how much data remains.
+ *
+ * As a CONVENTION, the msgID's generated on the Server side are positive and those on the Client side negative.
+ *
+ * @param name              - Name for this Messaging system. Used only for user messages (debug, info, warn, error)
+ * @param instrm            - the InputStream to be read for inbound messages - each chunk expanded to a Message instance
+ * @param outstrm           - the OutputStream where Message instances are written
+ * @param msgIDGenerator    - AtomicLong used to generate msgID values for this MessagingActor system. Will be provided
+ *                            to all Application actors in the AppConnect message.
+ */
+class MessagingActor(val nameIn:String, val instrm:InputStream, val outstrm:OutputStream, val msgIDGenerator:AtomicLong = new AtomicLong) extends Actor {
   import Messaging._
-  var startup:Startup     = _
-  var inbound:ActorRef    = _
-  var outbound:ActorRef   = _
+
+  val label               = s"Messaging $nameIn"
   val connections         = mutable.Map.empty[Long, ActorRef]     // connID -> application actor
 
-  def receive = {
-    case msg:Startup      => if(bMessagingOpen) debug(s"MessagingActor starting -- ${msg.toShort}")
-                             startup = msg
-                             inbound = context.actorOf(Props[MessagingInActor])
-                             outbound= context.actorOf(Props[MessagingOutActor])
-                             toInAndOut(msg)
+  // ---- Executed at instantiation
+  if(bMessagingOpen) debug(s"$label starting -- InputStream: ${System.identityHashCode(instrm)}, OutputStream: ${System.identityHashCode(outstrm)}, MsgIDGen: ${System.identityHashCode(msgIDGenerator)}")
+  val inbound = context.actorOf(Props(new MessagingInActor(nameIn, instrm, msgIDGenerator)))
+  val outbound= context.actorOf(Props(new MessagingOutActor(nameIn, outstrm, msgIDGenerator)))
+  /////////////////////////////////
 
-    case conn:StartConn   => startConn("MessagingActor", conn, connections, sendToApp = true, outbound = outbound, msgID = Some(startup.msgIDGenerator))
+  def receive = {
+
+    case conn:StartConn   => startConn(label, conn, connections, sendToApp = true, outbound = outbound, msgID = Some(msgIDGenerator))
                              toInAndOut(conn)               // NOTE: May be a dup message
 
     case msg:Close        => if(bMessagingClose) debug(msg.toShort)
@@ -124,20 +155,15 @@ private case class ReadChunks()
 /** Actor to handle the InputStream of the socket. Will send Message messages to the Application
  *  Infinite loop reads the Inputstream, sending messages to 'self' so Actor never blocks.
  **/
-class MessagingInActor extends Actor {
+class MessagingInActor(nameIn:String, instrm:InputStream, msgID:AtomicLong) extends Actor {
   import Messaging._
 
-  // Allocate & re-use max size buffer
-  val bfr                = new Array[Byte](Messaging.maxMessageSize)
-  val bb                 = ByteBuffer.wrap(bfr)
+  val name        = s"Messaging $nameIn IN"
+  val connections = mutable.Map.empty[Long, ActorRef]         // connID -> application actor
+  val bfr         = new Array[Byte](Messaging.maxMessageSize) // Allocate & re-use max size buffer
+  val bb          = ByteBuffer.wrap(bfr)
 
   var bigBfr:Array[Byte] = null             // Large buffer allocated if we need to de-chunk, then released
-
-  // Initialized when 'msg' is received
-  var startup:Startup    = null
-  var name:String        = _
-  var instrm:InputStream = _
-  val connections        = mutable.Map.empty[Long, ActorRef]     // connID -> application actor
 
   // Variables while reading a message
   var length             = 0
@@ -146,15 +172,9 @@ class MessagingInActor extends Actor {
   var lastSleep          = 0
   var otw:OnTheWireBuffer= _
 
-  def receive = {
-    case m:Startup      => if(startup == null) {
-                              startup = m
-                              name    = startup.name
-                              instrm  = startup.instrm
-                              if(bMessagingOpen) debug(s"MessagingInActor $name starting -- ${startup.toShort}")
-                           } else
-                              warn(s"MessagingInActor $name - duplicate 'Startup' message ignored")
+  if(bMessagingOpen) debug(s"$name starting -- InStrm: ${System.identityHashCode(instrm)}, msgID: ${System.identityHashCode(msgID)}")
 
+  def receive = {
     case conn:StartConn => startConn(s"MessagingIn $name", conn, connections)
 
     case cls:Close      => instrm.close
@@ -238,7 +258,7 @@ class MessagingInActor extends Actor {
     if(connID == connIDBroadcast) {
       connections.values.foreach( _ ! msg)
     } else connections.get(connID) match {
-      case None       => error(f"Messaging $name -- ConnID: $connID%,d is not defined")
+      case None       => error(f"$name -- ConnID: $connID%,d is not defined")
       case Some(ref)  => ref ! msg
     }
   }
@@ -253,29 +273,16 @@ class MessagingInActor extends Actor {
  *  Note: Large data transfers should be chunked by the Application so the whole thing is not in memory!
  *  ACK is sent once each message or chunk is passed to the OutputStream
  */
-class MessagingOutActor extends Actor with RequiresMessageQueue[UnboundedStablePriorityMailbox] {
+class MessagingOutActor(val nameIn:String, val outstrm:OutputStream, val msgID:AtomicLong) extends Actor with RequiresMessageQueue[UnboundedStablePriorityMailbox] {
   import Messaging._
-  var startup:Startup     = null
-  var name:String         = _
-  var outstrm:OutputStream= _
+  val name:String         = s"$nameIn OUT"
   val connections         = mutable.Map.empty[Long, ActorRef]     // connID -> application actor
 
-  //def xxx = {
-  //  new UnboundedStablePriorityMailbox(new java.util.Comparator[MessageBase] {
-  //
-  //    def compare(o1: MessageBase, o2: MessageBase): Int = 0
-  //  }, 100)
-  //}
-  def receive = {
-    case m:Startup      =>if(startup == null) {
-                            startup = m
-                            name    = startup.name
-                            outstrm = startup.outstrm
-                            if(bMessagingOpen) debug(s"MessagingOutActor $name starting -- ${startup.toShort}")
-                          } else
-                            warn(s"MessagingOutActor $name - duplicate 'Startup' message ignored")
+  if(bMessagingOpen) debug(s"$name starting -- OutStrm: ${System.identityHashCode(outstrm)}, msgID: ${System.identityHashCode(msgID)}")
 
-    case conn:StartConn => startConn(s"MessagingOut $name", conn, connections)
+  def receive = {
+
+    case conn:StartConn => startConn(name, conn, connections)
 
     case otw:Message    => if(otw.failReason != 0)
                               sender ! NACK(otw.connID, otw.msgID, otw.failReason)

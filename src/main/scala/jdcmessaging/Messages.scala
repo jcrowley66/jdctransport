@@ -5,43 +5,7 @@ import java.io.{InputStream, OutputStream}
 import akka.actor.ActorRef
 
 /**
- * Startup message sent to MessagingActor to initiate a new Messaging instantiation.
- *
- * Regular messages will automatically be chunked/de-chunked by the system, so the application doesn't have
- * to worry about the size of a message. Very large messages - e.g. a series of chunks intended to transfer
- * a 4GB file - should be chunked by the Application.
- * 
- * Each MessagingActor handles one InputStream and one OutputStream, and these should not be touched outside of
- * that MessagingActor or everything will probably break!
- *
- * Within one MessagingActor, multiple Connection IDs may be defined - so that several logical connections can be
- * multiplexed across the same InputStream/OutputStream. Since each StartConn message also declares the Actor for
- * the Application, different Actors may be specified for each Connection, or the same Actor for all Connections
- * (and the Application must then handle the de-multiplexing), or some combination - e.g. one Application Actor
- * handles N Connections, another Application Actor handles M Connections, etc.
- *
- * Only one msgIDGenerator exists for each MessagingActor, so if several Connections are multiplexed the msgID's
- * within outbound messages will not normally be in sequence for each Connection.
- *
- * Each time an outbound Message is sent, an ACK will be sent to ALL Application actors with it's msgID. Comparing
- * this to the current value of the msgIDGenerator yields the number of outbound messages still in the queue and
- * allows the Application to throttle if necessary. If the Application is sending messages in chunks, then the
- * ACK fields on totalData & amtSent also provide information about how must data remains.
- *
- * As a CONVENTION, the msgID's generated on the Server side are positive and those on the Client side negative.
- *
- * @param name              - Name for this Messaging system. Used only for user messages (debug, info, warn, error)
- * @param instrm            - the InputStream to be read for inbound messages - each chunk expanded to a Message instance
- * @param outstrm           - the OutputStream where Message instances are written
- * @param msgIDGenerator    - AtomicLong used to generate msgID values for this MessagingActor system. Will be provided
- *                            to all Application actors in the AppConnect message.
- */
-case class Startup (name:String, instrm:InputStream, outstrm:OutputStream, msgIDGenerator:AtomicLong = new AtomicLong) {
-  def toShort = s"Startup[Name: $name, InputStream: ${System.identityHashCode(instrm)}, OutputStream: ${System.identityHashCode(outstrm)}, MsgIDGen: ${System.identityHashCode(msgIDGenerator)}]"
-}
-
-/**
- * Once the MessagingActor has been initialized with the Startup message, this message may be sent to define a Connection.
+ * Once the MessagingActor has been initialized, this message may be sent to define a Connection.
  *
  * @param connID            - unique ID of this connection
  * @param actorApplication  - ref to the Actor which has the actual Application logic - where to send inbound messages
