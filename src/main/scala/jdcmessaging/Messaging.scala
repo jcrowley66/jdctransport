@@ -11,7 +11,7 @@ import scala.collection.mutable
 
 /**
 TODO
-=====
+----
 -- implement the SSL support
 */
 /** This is a low-level messaging system between two applications. More importantly, it can be
@@ -24,10 +24,11 @@ TODO
  *  -- transparently have either direct connections or via Xchange
  *     -- only differences are some initial login messages needed to establish the cross-connect thru Xchange
  *        -- if direct connect, participants just ignore these
- *  -- low latency - just real-time message passing, no permanent storage or queueing
+ *  -- low latency - just real-time message passing, no permanent storage or persistent queueing
  *  -- incorporates both normal messages and file transfers
  *     -- and anything else - only the ultimate sender & receiver know the meaning & format of each message
  *  -- the 'name' of the message is critical
+ *     -- must not match one of the 'name's defined in the Messaging object -- see the msg... name constants
  *     -- should be unique within the application
  *     -- must be agreed upon by senders and receivers
  *     -- tells the receiver how to interpret the 'data'
@@ -38,7 +39,7 @@ TODO
  */
 
 /** Overview
- *  ========
+ *  --------
  *  -- recipient puts up a ServerSocket and accepts connections from senders
  *  -- upon accepting a new connection assigns a unique connection ID (for the life of the application)
  *  -- creates MessagingActor instance to handle this connection (passes the in/out Socket streams in Messaging message)
@@ -46,32 +47,37 @@ TODO
  *     -- creates a child MessagingInActor which
  *        -- reads the inputstream from the socket into buffers
  *          -- will de-chunk messages if requested (as from automatic chunking from MessagingOutActor)
- *        -- creates an Message instance
+ *        -- creates a Message instance
  *        -- sends this to the application for processing (actorApplication)
  *     -- creates a child MessagingOutActor which
  *        -- handles the OutputStream of the socket
  *        -- receives Message messages from the application
  *          -- will 'chunk' the messages if too long as given in Message
  *        -- converts to buffer form and sends to the outputstream
- *        -- sends an Ack back to the sender so that the sender can implement back-pressure logic
+ *        -- sends an Ack back to the all of the Application actors so that they can implement back-pressure logic
  *
- * -- the MessagingOutActor establishes a Priority mailbox scheme. All normal messages are usually passed as Priority
- *    messages. Some very large operations (e.g. file transfer) should be sent as low-priority, so that they do
- *    not clog everything up.
  */
 
 /** Startup Sequence - Server side
- *  ==============================
+ *  ------------------------------
  *  -- puts up a ServerSocket
  *  -- accept() returns with a Socket
  *  -- start the Application Actor
  *  -- assign connID (from global AtomicLong)
- *  -- start Messaging actor - send Messaging message to it w connID, inputstream, outputstream, msgID Atomic, actorRef for app
- *  -- create OTW message w connID & name = connectionCreated
- *  -- send this to Socket output stream so remote end has connID
+ *  -- start Messaging actor - send Startup message to it w name, inputstream, outputstream, msgID Atomic
+ *  -- send StartConn message to Messaging to define this ConnID
+ *  -- create Message w connID & name = connectionCreated
+ *  -- send this to MessagingOutActor so remote end knows the connID
  *
  *  Startup Sequence - Client side
- *  ==============================
+ *  ------------------------------
+ *  -- client gets URL & port for the Server (from params, login screen, wherever
+ *  -- starts an Application server
+ *  -- puts up a Socket(URS, port)
+ *  -- start Messaging actor w name, inputstream, outputstream, msgID generator
+ *  -- wait for the 'connectionCreated' message from the server
+ *  -- send a StartConn message to the Messaging Actor to define the connID
+ *  -- start normal processing
  *
  */
 
@@ -388,10 +394,10 @@ object Messaging {
   // These messages are handled by the Messaging system itself. There is no security and/or login involved, the
   // application can require login messages (handled by the application) if desired.
   // These names are specialized and should not be used by any other part of the application
-  val createConnection = "##CreateConnection$$"     // User to server-side to open a connection
-  val connectionCreated= "##ConnectionCreated$$"    // Connection ID stored as Int at the beginning of data array
-  val closeConnection  = "##CloseConnection$$"      // User to server-side, no response, server just closes the socket
-  val connectionRefused= "##ConnectionRefused$$"    // Error Code stored as Int at the beginning of data array
+  val msgCreateConnection = "##CreateConnection$$"     // User to server-side to open a connection
+  val msgConnectionCreated= "##ConnectionCreated$$"    // Connection ID stored as Int at the beginning of data array
+  val msgCloseConnection  = "##CloseConnection$$"      // User to server-side, no response, server just closes the socket
+  val msgConnectionRefused= "##ConnectionRefused$$"    // Error Code stored as Int at the beginning of data array
 
   /** One of the actors got a StartConn message - update the given Map in place
    *  and (optionally) send an AppConnect message to the Application

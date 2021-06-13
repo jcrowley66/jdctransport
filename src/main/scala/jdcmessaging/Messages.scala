@@ -9,8 +9,7 @@ import akka.actor.ActorRef
  *
  * Regular messages will automatically be chunked/de-chunked by the system, so the application doesn't have
  * to worry about the size of a message. Very large messages - e.g. a series of chunks intended to transfer
- * a 4GB file - should be chunked by the Application. The chunks for such large messages are normally also
- * sent through the low-priority mailbox to the outbound Actor to avoid congesting the channel.
+ * a 4GB file - should be chunked by the Application.
  * 
  * Each MessagingActor handles one InputStream and one OutputStream, and these should not be touched outside of
  * that MessagingActor or everything will probably break!
@@ -26,13 +25,16 @@ import akka.actor.ActorRef
  *
  * Each time an outbound Message is sent, an ACK will be sent to ALL Application actors with it's msgID. Comparing
  * this to the current value of the msgIDGenerator yields the number of outbound messages still in the queue and
- * allows the Application to throttle if necessary.
+ * allows the Application to throttle if necessary. If the Application is sending messages in chunks, then the
+ * ACK fields on totalData & amtSent also provide information about how must data remains.
  *
  * As a CONVENTION, the msgID's generated on the Server side are positive and those on the Client side negative.
  *
+ * @param name              - Name for this Messaging system. Used only for user messages (debug, info, warn, error)
  * @param instrm            - the InputStream to be read for inbound messages - each chunk expanded to a Message instance
  * @param outstrm           - the OutputStream where Message instances are written
- * @param msgIDGenerator    - AtomicLong used to generate msgID values for this MessagingActor system.
+ * @param msgIDGenerator    - AtomicLong used to generate msgID values for this MessagingActor system. Will be provided
+ *                            to all Application actors in the AppConnect message.
  */
 case class Startup (name:String, instrm:InputStream, outstrm:OutputStream, msgIDGenerator:AtomicLong = new AtomicLong) {
   def toShort = s"Startup[Name: $name, InputStream: ${System.identityHashCode(instrm)}, OutputStream: ${System.identityHashCode(outstrm)}, MsgIDGen: ${System.identityHashCode(msgIDGenerator)}]"
@@ -74,7 +76,10 @@ case class Close(connID:Long) {
  *  messages still in the outbound mailbox. The Application(s) may then throttle processing
  *  until the queue size is reduced.
  *
- *  Note: This backpressure logic is within the Application, not this Messaging system itself!
+ *  Note: This backpressure logic is within the Application, not this Messaging system itself! If the Application
+ *        is sending large data amounts in chunks, then the totalData & amtSent fields can be used to determine
+ *        how many chunks are still in the queue in order to apply backpressure. The number of chunks should be
+ *        minimized where possible, since these chunks may delay the sending of other Application messages.
  **/
 case class ACK(connID:Long, msgID:Long, totalData:Long, amtSent:Long)
 
