@@ -1,4 +1,4 @@
-package messaging
+package jdcmessaging
 
 import java.nio._
 import java.io.{InputStream, OutputStream}

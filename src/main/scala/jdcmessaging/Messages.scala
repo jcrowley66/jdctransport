@@ -1,4 +1,4 @@
-package messaging
+package jdcmessaging
 
 import java.util.concurrent.atomic.AtomicLong
 import java.io.{InputStream, OutputStream}
