@@ -21,7 +21,7 @@ case class StartConn(connID:Long, actorApplication:ActorRef) {
  * @param actorOutMessaging - where the Application should send outbound Message instances
  */
 case class AppConnect(connID:Long, actorOutMessaging:ActorRef, msgIDGenerator:Option[AtomicLong]){
-  def toShort = f"Messaging[ConnID: $connID%,d]"
+  def toShort = f"Messaging[ConnID: $connID%,d, OutMsg: ${System.identityHashCode(actorOutMessaging)}, MsgIDGen: ${System.identityHashCode(msgIDGenerator)}]"
 }
 /** Message sent to the MessagingActor (and the In and Out Actors) to close down a particular
  *  Connection. If connID == -1, or this is the LAST active connID, then do a complete shutdown
@@ -57,5 +57,3 @@ object NACK {
   val badHash    = 4
   val badOTW     = 5                // Presented OverTheWireExpanded with key fields missing
 }
-
-//case class MessagingStarted(messaging:ActorRef, inbound:ActorRef, outbound:ActorRef, app:ActorRef)
