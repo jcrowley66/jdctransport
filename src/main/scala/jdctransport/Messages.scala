@@ -1,4 +1,4 @@
-package jdcmessaging
+package jdctransport
 
 import java.util.concurrent.atomic.AtomicLong
 import java.io.{InputStream, OutputStream}
@@ -7,27 +7,30 @@ import akka.actor.ActorRef
 /**
  * Once the MessagingActor has been initialized, this message may be sent to define a Connection.
  *
- * @param connID            - unique ID of this connection
+ * @param connID            - unique ID of this connection or ZERO if not yet assigned (
  * @param actorApplication  - ref to the Actor which has the actual Application logic - where to send inbound messages
  */
-case class StartConn(connID:Long, actorApplication:ActorRef) {
+final case class StartConn(connID:Long, actorApplication:ActorRef) {
   def toShort = f"StartConn[ConnID: $connID%,d, AppActor: $actorApplication]"
 }
 
 /** Message sent to the Application Actor to provide the connection information the Application will need.
  *
- * @param connID            - unique ID of this connection
- * @param msgIDGenerator    - AtomicLong used to assign new msgID values when an outbound Message is created
+ * @param connID            - unique ID of this connection -- may still be ZERO in some situations, but can
+ *                            still get the ActorRef of the outbound Actor and (sometimes) the msgIDGenerator
  * @param actorOutMessaging - where the Application should send outbound Message instances
  */
-case class AppConnect(connID:Long, actorOutMessaging:ActorRef, msgIDGenerator:Option[AtomicLong]){
-  def toShort = f"Messaging[ConnID: $connID%,d, OutMsg: ${System.identityHashCode(actorOutMessaging)}, MsgIDGen: ${System.identityHashCode(msgIDGenerator)}]"
+final case class AppConnect(connID:Long, actorOutMessaging:ActorRef){
+  def toShort = f"Messaging[ConnID: $connID%,d, OutMsg: ${System.identityHashCode(actorOutMessaging)}]"
 }
+/** If on the client side, connID is not yet known, so can send this to get things started */
+final case class StartClient(appActor:ActorRef)
+
 /** Message sent to the MessagingActor (and the In and Out Actors) to close down a particular
  *  Connection. If connID == -1, or this is the LAST active connID, then do a complete shutdown
  *  Message is also passed to the Application for that Connection (or ALL Applications)
  **/
-case class Close(connID:Long) {
+final case class Close(connID:Long) {
   def toShort = s"Messaging Close ${if(connID == Messaging.connIDCloseAll) "ALL Connections" else s"ConnID: $connID"}"
 }
 
@@ -45,10 +48,10 @@ case class Close(connID:Long) {
  *        how many chunks are still in the queue in order to apply backpressure. The number of chunks should be
  *        minimized where possible, since these chunks may delay the sending of other Application messages.
  **/
-case class ACK(connID:Long, msgID:Long, totalData:Long, amtSent:Long)
+final case class ACK(connID:Long, msgID:Long, totalData:Long, amtSent:Long)
 
 /** A NACK for an outbound message -- sent back to the original sender only */
-case class NACK(connID:Long, msgID:Long, reason:Int)
+final case class NACK(connID:Long, msg:Message)
 
 object NACK {
   val hashFailed = 1

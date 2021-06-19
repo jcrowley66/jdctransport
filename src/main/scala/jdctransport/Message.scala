@@ -1,4 +1,4 @@
-package jdcmessaging
+package jdctransport
 
 import java.util.Arrays
 import akka.actor.ActorRef
@@ -33,7 +33,7 @@ case class Message (
   ackTo:ActorRef    = ActorRef.noSender       // IFF provided, this Message will be sent to that Actor as an ack
 ) {
   import Messaging._
-  def isPopulated  = connID != 0 && msgID != 0 && (name.nonEmpty || isChunked)
+  def isPopulated  = connID != 0  && msgID != 0 && (name.nonEmpty || isChunked)
   def isChunked    = (flags & Messaging.flagChunked) > 0
   def isDeChunk    = (flags & Messaging.flagDeChunk) > 0
   def szName       = if(name.isEmpty) 0 else name.getBytes.length
@@ -45,7 +45,7 @@ case class Message (
   def isOutbound   = !isInbound
 
   def strChunked = if(isChunked) s"Chunked: T, DeChunk: ${if(deChunk) "T" else "F"}," else ""
-  def strShort   = f"OTW[Lnth: $length%,d,$strChunked ConnID: $connID%,d, MsgID: $msgID%,d, TotalData: $totalData%,d, DataSz: ${data.length}%,d, Name: $name]"
+  def strShort   = f"Message[Lnth: $length%,d,$strChunked ConnID: $connID%,d, MsgID: $msgID%,d, TotalData: $totalData%,d, DataSz: ${data.length}%,d, Name: $name]"
 
   def mustBeChunked = length > maxMessageSize
 
@@ -114,8 +114,8 @@ case class OnTheWireBuffer( bb:ByteBuffer, isFirstChunk:Boolean = true, isInboun
   def notChunked   = !isChunked
   def isDeChunk    = (flags & Messaging.flagDeChunk) > 0
 
-  /** Return the data as an Array[Byte] */
-  def data         = Arrays.copyOfRange(bb.array, posData, dataLength)
+  /** Return the data as an Array[Byte] - Note: dataLength may be 0 */
+  def data         = if(dataLength > 0) Arrays.copyOfRange(bb.array, posData, dataLength) else new Array[Byte](0)
 
   def fail         =if(!isValidLength) NACK.badLength
   else if(!isValidBfr) NACK.badBuffer
