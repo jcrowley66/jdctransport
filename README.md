@@ -1,5 +1,5 @@
-# Messaging
-A basic low-level messaging library based on AKKA Actors.
+# JDCTransport
+A basic low-level message transport library based on AKKA Actors.
 
 This is intended to:
 - read data from an InputStream
@@ -11,26 +11,26 @@ This is intended to:
 - forward all inbound messages to an **Application**
 - accept Messages from the Application and send to the OutputStream
 
-A **MessagingActor** is the control point for a single Messaging system. It
+A **TransportActor** is the control point for a single JDCTransport system. It
 will be given the InputStream and OutputStream to process, and these should
-be exclusive to this MessagingActor. It is also given a **msgIDGenerator** so
+be exclusive to this TransportActor. It is also given a **msgIDGenerator** so
 that all messages can be assigned a unique ID.
 
-The MessagingActor in turn will start a **MessagingInActor** and a **MessagingOutActor**.
+The TransportActor in turn will start a **TransportInActor** and a **TransportOutActor**.
 
 Important concepts:
 - every Connection is assigned a unique ConnectionID
 - each ConnectionID is associated with an **ApplicationActor** (created by the
-  caller and sent to the MessagingActor at startup)
+  caller and sent to the TransportActor at startup)
 - every Message is assigned a unique MessageID 
-- one Messaging instantiation may multiplex several ConnectionIDs
-    - One **Startup** and one or more **StartConn** messages will be sent to a MessagingActor
+- one JDCTransport instantiation may multiplex several ConnectionIDs
+    - One **Startup** and one or more **StartConn** messages will be sent to a TransportActor
     - The same ApplicationActor may be used for each Connection, a different
     ApplicationActor for each Connection, or any combination. This is all 
-      determined by the caller who intially created the MessagingActor.
+      determined by the caller who intially created the TransportActor.
       
 # Xchange Server
-Allows **Messaging** instances on Servers and Clients to register and cross-connect
+Allows **JDCTransport** instances on Servers and Clients to register and cross-connect
 so that all messages are transparently forwarded.
 
 If both a Server and a Client are **visible** to each other, then they can connect directly.

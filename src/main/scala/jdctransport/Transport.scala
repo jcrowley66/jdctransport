@@ -102,35 +102,35 @@ TODO
  * Each time an outbound Message is sent, an ACK will be sent to ALL Application actors with it's msgID. Comparing
  * this to the current value of the msgIDGenerator yields the number of outbound messages still in the queue and
  * allows the Application to throttle if necessary. If the Application is sending messages in chunks, then the
- * ACK fields on totalData & amtSent also provide information about how much data remains.
+ * appData fields (if populated) also provide information about how much data remains.
  *
  * As a CONVENTION, the msgID's generated on the Server side are positive and those on the Client side negative.
  *
- * @param name              - Name for this Messaging system. Used only for user messages (debug, info, warn, error)
+ * @param name              - Name for this transport system. Used only for user messages (debug, info, warn, error)
  * @param instrm            - the InputStream to be read for inbound messages - each chunk expanded to a Message instance
  * @param outstrm           - the OutputStream where Message instances are written
  */
-class MessagingActor(val nameIn:String, val instrm:InputStream, val outstrm:OutputStream) extends Actor {
-  import Messaging._
+class TransportActor(val nameIn:String, val instrm:InputStream, val outstrm:OutputStream) extends Actor {
+  import Transport._
 
-  val label               = s"MessagingPARENT: $nameIn"
-  val connections         = mutable.Map.empty[Long, ActorRef]     // connID -> application actor
+  val name        = s"TransportPARENT: $nameIn"
+  val connections = mutable.Map.empty[Long, ActorRef]     // connID -> application actor
 
   // ---- Executed at instantiation
-  if(bMessagingOpen) debug(s"$label STARTING $self -- InputStream: ${System.identityHashCode(instrm)}, OutputStream: ${System.identityHashCode(outstrm)}")
-  val outbound= context.actorOf(Props(new MessagingOutActor(nameIn, outstrm)))
-  val inbound = context.actorOf(Props(new MessagingInActor(nameIn, instrm, outbound)))
+  if(bTransportOpen) debug(s"$name STARTING $self -- InputStream: ${System.identityHashCode(instrm)}, OutputStream: ${System.identityHashCode(outstrm)}")
+  val outbound= context.actorOf(Props(new TransportOutActor(nameIn, outstrm)))
+  val inbound = context.actorOf(Props(new TransportInActor(nameIn, instrm, outbound)))
   /////////////////////////////////
 
   def receive = {
 
-    case conn:StartConn   =>if(bMessagingOpen) debug(s"$label $self -- ${conn.toShort}")
-                            startConn(label, conn, connections, sendToApp = true, outbound = outbound)
+    case conn:StartConn   =>if(bTransportOpen) debug(s"$name $self -- ${conn.toShort}")
+                            startConn(name, conn, connections, sendToApp = true, outbound = outbound)
                             toInAndOut(conn)               // NOTE: May be a dup message
 
     case s:StartClient    => toInAndOut(s)
 
-    case msg:Close        => if(bMessagingClose) debug(msg.toShort)
+    case msg:Close        => if(bTransportClose) debug(msg.toShort)
                              if(msg.connID == connIDCloseAll){
                                connections.foreach{ case(connID, ref) => ref ! msg}
                                toInAndOut(msg)
@@ -140,7 +140,7 @@ class MessagingActor(val nameIn:String, val instrm:InputStream, val outstrm:Outp
                                  case Some(ref) => ref ! msg
                                                    toInAndOut(msg)
                                }
-    case unk              => warn(s"$label -- UNKNOWN skipped -- $unk")
+    case unk              => warn(s"$name -- UNKNOWN skipped -- $unk")
   }
 
   def toInAndOut(msg:AnyRef) = {
@@ -149,30 +149,32 @@ class MessagingActor(val nameIn:String, val instrm:InputStream, val outstrm:Outp
   }
 }
 
-// Used by MessagingInActor to keep reading InputStream without a complete block
-private final case class ReadInitial()     // A read - just get the 'length' field
-private final case class ReadRemaining()
-private final case class ReadChunks()
+// Used by TransportInActor to keep reading InputStream without a complete block
+final case class ReadInitial()     // A read - just get the 'length' field
+final case class ReadRemaining()
 
 /** Actor to handle the InputStream of the socket. Will send Message messages to the Application
  *  Infinite loop reads the Inputstream, sending messages to 'self' so Actor never blocks.
  **/
-class MessagingInActor(nameIn:String, instrm:InputStream, outboundActor:ActorRef) extends Actor {
-  import Messaging._
+class TransportInActor(nameIn:String, instrm:InputStream, outboundActor:ActorRef) extends Actor {
+  import Transport._
 
-  val name        = s"    MessagingIN: $nameIn"
+  val name        = s"    TransportIN: $nameIn"
   val connections = mutable.Map.empty[Long, ActorRef]         // connID -> application actor
                                                               // NOTE: will have 0 -> appActor created by StartClient
-  val bfr         = new Array[Byte](Messaging.maxMessageSize) // Allocate & re-use max size buffer
+  val rdInitial   = ReadInitial()                             // Only need 1 instance of each
+  val rdRemaining = ReadRemaining()                           // ... of these
+
+  val bfr         = new Array[Byte](Transport.maxMessageSize) // Allocate & re-use max size buffer for normal messages
   val bb          = ByteBuffer.wrap(bfr)
 
   var bigBfr:Array[Byte] = null             // Large buffer allocated if we need to de-chunk, then released
+  var bigAmtRead         = 0                // How much data is already in the bigBfr
 
   var readCycleStarted   = false
 
-  // Variables while reading a message
+  // Variables while reading one segment - either a complete Message or a Chunk
   var length             = 0
-  var totalData:Long     = 0          // Needed primarily if we are de-chunking a message
   var amtRead            = 0
   var lastSleep          = 0
   var sleepCount         = 0
@@ -180,113 +182,127 @@ class MessagingInActor(nameIn:String, instrm:InputStream, outboundActor:ActorRef
 
   var otwBase:OnTheWireBuffer= _
 
-  if(bMessagingOpen) debug(s"$name STARTING $self -- InStrm: ${System.identityHashCode(instrm)}")
+  if(bTransportOpen) debug(s"$name STARTING $self -- InStrm: ${System.identityHashCode(instrm)}")
 
   def receive = {
-    case conn:StartConn => startConn(s"MessagingIn $name", conn, connections)
-                           if(!readCycleStarted) self ! ReadInitial()
+    case conn:StartConn => startConn(name, conn, connections)
+                           if(!readCycleStarted)
+                             self ! rdInitial
 
-    case clt:StartClient=> if(bMessagingOutbound) debug(s"$name -- received StartClient")
+    case clt:StartClient=> if(bTransportOutbound) debug(s"$name -- received StartClient")
                            if(!readCycleStarted) {
-                            readCycleStarted = true
-                            connections += (0L -> clt.appActor)
-                            self ! ReadInitial()
-                          }
+                             readCycleStarted = true
+                             connections += (0L -> clt.appActor)
+                             self ! rdInitial
+                           }
 
     case cls:Close      => instrm.close
                            context.stop(self)
 
-    case r:ReadInitial  =>//if(bMessagingInDtl) debug(s"$name -- got ReadInitial message")
+    case r:ReadInitial  =>if(bTransportRdCycle) debug(s"$name -- got ReadInitial message")
                           readCycleStarted = true
-                          bb.rewind                    // Start reading a new chunk/message
+                          // Start reading one segment - a chunk/message. Read at least the base info if available
+                          bb.asInstanceOf[Buffer].rewind    // See https://stackoverflow.com/questions/61267495/exception-in-thread-main-java-lang-nosuchmethoderror-java-nio-bytebuffer-flip
                           if (instrm.available >= szBaseInfo) {
                             instrm.read(bfr, 0, szBaseInfo)
                             otwBase   = OnTheWireBuffer(bb)
                             length    = otwBase.length
-                            totalData = otwBase.totalData
                             amtRead   = szBaseInfo
-                            if(bMessagingInDtl) debug(s"$name -- Length: $length, totalData: $totalData")
-                            // The happy path - not de-chunking and the whole message is ready to be read
-                            if(!otwBase.isDeChunk && instrm.available >= length - szBaseInfo){
-                              instrm.read(bfr, szBaseInfo, length - szBaseInfo)
-                              val otw = OnTheWireBuffer(bb).asMessage
-                              if(bMessagingInbound) debug(s"OTW INBOUND: ${otw.strShort}")
-                              sendTo(otw, otwBase.connID)
-                              reset
-                              self ! ReadInitial()
-                            } else {
-                              self ! (if(otwBase.isDeChunk) ReadChunks else ReadRemaining)
-                            }
+                            if(bTransportInDtl) debug(s"$name -- ${otwBase.baseToString}")
+                            if(readSegmentOK)
+                              processSegment
+                            else
+                              self ! rdRemaining
                           } else {      // No input data available, wait an interval before trying again
                             sleepFor
-                            self ! ReadInitial()
+                            self ! rdInitial
                           }
 
-    case r:ReadRemaining=>// Read the remaining data for a Message if not a reChunk situation
-                          val avail = { val tmp = instrm.available
-                                        if (tmp > length - amtRead) length - amtRead else tmp
-                                      }
-                          if(bMessagingInDtl) debug(s"$name -- ReadRemaining Avail: $avail")
-                          if(avail > 0){
-                            instrm.read(bfr, amtRead, avail)
-                            amtRead += avail
-                            if(amtRead == length) {
-                              sendTo(OnTheWireBuffer(bb).asMessage, otwBase.connID)
-                              reset
-                              self ! ReadInitial()
-                            } else {
-                              lastSleep = 0             // Actually had some data, so reset the sleep to minimum
-                              self ! ReadRemaining()
-                            }
-                          } else {
+    case r:ReadRemaining=>// Read the remaining data for one Chunk/Message
+                          if(readSegmentOK)
+                            processSegment
+                          else {
                             sleepFor
-                            self ! ReadRemaining()
-                          }
-
-    case r:ReadChunks   =>// Have to de-chunk the incoming Message - we probably chunked it on the outbound side
-                          if(bigBfr==null) {
-                            bigBfr = new Array[Byte](totalData.toInt)
-                            System.arraycopy(bfr, 0, bigBfr, 0, szBaseInfo) // copy the Base Info read by ReadInitial
-                          }
-                          val availNow = instrm.available
-                          if(bMessagingInDtl) debug(s"$name -- ReadChunks availNow: $availNow")
-                          if(availNow > 0){
-                            val readAmt = (if(availNow < totalData - amtRead) availNow else totalData - amtRead).toInt
-                            instrm.read(bigBfr, amtRead, readAmt)
-                            amtRead += readAmt
-                            if(amtRead==totalData){   // We're done!
-                              val bigBB = ByteBuffer.wrap(bigBfr)
-                              sendTo(OnTheWireBuffer(bigBB).asMessage, otwBase.connID)
-                              reset
-                              self ! ReadInitial()
-                            } else {
-                              lastSleep = 0
-                              self ! ReadChunks()
-                            }
-                          } else {
-                            sleepFor
-                            self ! ReadChunks()
+                            self ! rdRemaining
                           }
 
     case unk             => warn(s"$name -- UNKNOWN skipped -- $unk")
   }
 
+  // Read more data for this segment, return TRUE if read the complete segment
+  def readSegmentOK:Boolean = {
+    val avail = instrm.available
+    if(bTransportSegment) debug(f"$name -- ReadSegmentOK Avail: $avail%,d, Length: $length%,d, AmtRead: $amtRead%,d")
+    if(avail == 0)
+      false
+    else {
+      lastSleep = 0             // Restart the sleep cycle since some data was available
+      if(avail >= length - amtRead) {
+        instrm.read(bfr, amtRead, length - amtRead)
+        amtRead = length
+        true
+      } else {
+        instrm.read(bfr, amtRead, avail)
+        amtRead += avail
+        false
+      }
+    }
+  }
+  // 'bfr' contains a complete Chunk or Message, decide what to do with it
+  def processSegment = {
+    reset         // Reset the size & counters for reading one segment
+    val seg = OnTheWireBuffer(bb, isInboundParam = true).asMessage
+    if (bTransportSegment) debug(s"$name OTW INBOUND SEGMENT: ${seg.strShort}")
+    if(!seg.isDeChunk){         // We don't have to de-chunk, just send the msg to the App
+      sendTo(seg)
+    } else {
+      if(seg.isFirstChunk && seg.isLastChunk){  // Handle aberration - de-chunk & both first & last chunks in one segment
+        sendTo(seg)
+      } else if(bigBfr==null) {
+        bigBfr = new Array[Byte](Transport.maxMessageSize * 12)         // Guess on size, expand if needed
+        System.arraycopy(bfr, 0, bigBfr, 0, seg.length) // copy the first segment
+        bigAmtRead = seg.length
+        if(bTransportDeChunk) debug(f"DECHUNK -- Allocate BigBfr AmtRead: $bigAmtRead%,d, ${seg.strShort}")
+      } else {
+        val dataLnth = seg.data.length
+        if(bigAmtRead + dataLnth > bigBfr.length){        // Expand the buffer if necessary
+          val tmp = bigBfr
+          bigBfr = new Array[Byte](bigBfr.length * 2)
+          System.arraycopy(tmp, 0, bigBfr, 0, bigAmtRead)
+          if(bTransportBfrExpand) debug(f"$name -- OTW INBOUND Expand BigBfr from ${tmp.length}%,d to ${bigBfr.length}%,d")
+        }
+        System.arraycopy(seg.data, 0, bigBfr, bigAmtRead, dataLnth)
+        bigAmtRead += dataLnth
+        if(bTransportDeChunk) debug(f"DECHUNK AmtRead: $bigAmtRead%,d, DataLnth: $dataLnth%,d, ${seg.strShort}")
+        if(seg.isLastChunk){
+          val bbBig = ByteBuffer.wrap(bigBfr)
+          bbBig.putInt(offsetLength, bigAmtRead)                                  // Set the 'length' to the correct value
+          bbBig.put(offsetFlags, (bbBig.get(offsetFlags) & ~anyChunkFlag).toByte) // Clear the 'chunk' flags
+          val sendMsg = OnTheWireBuffer(bbBig, isInboundParam = true).asMessage
+          if (bTransportDeChunk) debug(s"$name OTW INBOUND LAST CHUNK: ${sendMsg.strShort}")
+          sendTo(sendMsg)
+          bigBfr = null
+        }
+      }
+    }
+    self ! rdInitial
+  }
+
   def reset = {
     length      = 0
-    totalData   = 0
     lastSleep   = 0
     sleepCount  = 0
     sleepTotal  = 0
     amtRead     = 0
     otwBase     = null
-    bigBfr      = null
-
   }
-  def sendTo(msg:Message, connID:Long) = {
+  def sendTo(msg:Message) = {
+    val connID = msg.connID
+    if(bTransportInbound) debug(s"$name -- INBOUND MSG: ${msg.strShort}")
     if(connID == connIDBroadcast) {
       connections.values.filterNot( _ == 0).foreach( _ ! msg)
     } else connections.get(connID) match {
-      case None       =>if(msg.name==Messaging.msgConnectionCreated) {
+      case None       =>if(msg.name==Transport.msgConnectionCreated) {
                           connections.get(0L) match {     // Will have a ZERO entry if starting a Client
                             case None      => error(f"msgConnectionCreated received, but no ZERO-entry has been defined")
                             case Some(ref) =>
@@ -304,8 +320,8 @@ class MessagingInActor(nameIn:String, instrm:InputStream, outboundActor:ActorRef
     lastSleep = if(lastSleep==0) instrmSleepInitial else if(lastSleep * 2 >= instrmSleepMax) instrmSleepMax else lastSleep * 2
     sleepCount += 1
     sleepTotal += lastSleep
-    if(nMessagingSleep > 0){
-      if( (sleepCount % nMessagingSleep) == 0)
+    if(nTransportSleep > 0){
+      if( (sleepCount % nTransportSleep) == 0)
         debug(s"$name -- SLEEP: $sleepCount cycles, total millis: $sleepTotal")
     }
     Thread.sleep(lastSleep)
@@ -316,37 +332,32 @@ class MessagingInActor(nameIn:String, instrm:InputStream, outboundActor:ActorRef
  *  Note: Large data transfers should be chunked by the Application so the whole thing is not in memory!
  *  ACK is sent once each message or chunk is passed to the OutputStream
  */
-class MessagingOutActor(val nameIn:String, val outstrm:OutputStream) extends Actor {
-  import Messaging._
+class TransportOutActor(val nameIn:String, val outstrm:OutputStream) extends Actor {
+  import Transport._
   val name:String         = s"   MessagingOUT: $nameIn"
   val connections         = mutable.Map.empty[Long, ActorRef]     // connID -> application actor
 
-  if(bMessagingOpen) debug(s"$name STARTING $self -- OutStrm: ${System.identityHashCode(outstrm)}")
+  if(bTransportOpen) debug(s"$name STARTING $self -- OutStrm: ${System.identityHashCode(outstrm)}")
 
   def receive = {
 
     case conn:StartConn => startConn(name, conn, connections)
 
-    case _:StartClient  => if(bMessagingOutbound) debug(s"$name -- received StartClient")
+    case _:StartClient  => if(bTransportOutbound) debug(s"$name -- received StartClient")
                           // no-op at this time
 
-    case otw:Message    =>if(bMessagingOutbound) debug(s"$name -- Outbound Message -- ${otw.strShort}")
-                          if(otw.failReason != 0)
-                              sender ! NACK(otw.connID, otw)
-                            else if(!otw.isPopulated)
-                              sender ! NACK(otw.connID, otw)
+    case otw:Message    =>if(bTransportOutbound) debug(s"$name -- Outbound Message -- ${otw.strShort}")
+                          if(!otw.isValid)
+                              sender ! NACK(otw.connID, NACK.notValid, otw)
+                          else {
+                            if (otw.length > Transport.maxMessageSize)
+                              sendChunks(otw)
                             else {
-                              if (otw.length > Messaging.maxMessageSize)
-                                sendChunks(otw)
-                              else {
-                                sendOneBuffer(otw)
-                              }
-                              outstrm.flush
-                              // Even if we chunked it, to the sender it looks like a single message was sent
-                              sender ! ACK(otw.connID, otw.msgID, otw.totalData, otw.totalData)
-                              if(otw.ackTo != Actor.noSender)
-                                otw.ackTo ! otw
+                              sendOneBuffer(otw)
                             }
+                            // Even if we chunked it, to the sender it looks like a single message was sent
+                            sender ! ACK(otw.connID, otw.msgID, appData = otw.appData)
+                          }
 
     case cls:Close     => outstrm.close
                           context.stop(self)
@@ -356,7 +367,8 @@ class MessagingOutActor(val nameIn:String, val outstrm:OutputStream) extends Act
   private def sendOneBuffer(otw:Message) = {
     try {
       outstrm.write(otw.asBuffer)
-      if(bMessagingOutbound) debug(s"Sent -- ${otw.strShort}")
+      outstrm.flush
+      if(bTransportOutbound) debug(s"$name Sent -- ${otw.strShort}")
     } catch {
       case ex:Exception => error(s"MessagingOutActor for Connection ID: ${otw.connID}, Ex: $ex")
                            context.parent ! Close
@@ -366,7 +378,7 @@ class MessagingOutActor(val nameIn:String, val outstrm:OutputStream) extends Act
   // chunk the message and send directly. Cannot recursively send chunks to ourselves because then
   // chunks may arrive at the receiver interspersed with other application messages. This could be
   // handled, but then the Application could receive messages out of order.
-  // Note: Name and data1stChunk are only in the 1st chunk
+  // Note: Name only in the 1st chunk
   private def sendChunks(msg:Message) = {
     if(msg.isChunked) {
       error(f"Connection ID: ${msg.connID}%,d, MsgID: ${msg.msgID}%,d, Name: ${msg.name}, is already chunked but too large: ${msg.length}%,d")
@@ -375,27 +387,32 @@ class MessagingOutActor(val nameIn:String, val outstrm:OutputStream) extends Act
       if(msg.data.length > maxAutoChunk) {
         warn(f"Connection ID: ${msg.connID}%,d, MsgID: ${msg.msgID}%,d, Name: ${msg.name}, is very large: ${msg.data.length}%,d -- should be chunked by the Application")
       }
-      val maxData1st = maxData(msg.name.getBytes.length)
-      val maxDataNth = maxData(0)
-      val totalData  = msg.data.length
-      val numChunks  = ((totalData - maxData1st)/maxDataNth) + 1
+      val maxData1st  = maxData(msg.name.getBytes.length)
+      val maxDataNth  = maxData(0)
+      val totalData   = msg.data.length
+      val totalLess1st= totalData - maxData1st
+      val numChunks  = (totalLess1st/maxDataNth) + 1 +      // + 1 for the 1st chunk
+                       (if((totalLess1st % maxDataNth) == 0) 0 else 1) // + 1 for last piece unless an even fit
 
+      var appData    = AppData(totalData = totalData, sentSoFar = maxData1st, numChunks=numChunks, numThisChunk = 1)
       var dataOffset = 0
       for(n <- 1 to numChunks){
-        val sendMsg = if(n == 1)
-                        msg.copy(flags = flagChunked | flagDeChunk, data1stChunk = maxData1st, totalData = totalData, data = Arrays.copyOfRange(msg.data, 0, maxData1st))
-                      else {
+        val sendMsg = if(n == 1) {
+                        msg.copy(flags = flagChunked | flagDeChunk | flagFirstChunk, data = Arrays.copyOfRange(msg.data, 0, maxData1st), appData = Some(appData))
+                      } else {
                         val fullTo = dataOffset + maxDataNth
                         val dataTo = if(fullTo > msg.data.length) msg.data.length else fullTo
-                        msg.copy(flags = flagChunked | flagDeChunk, data1stChunk = 0, name="", totalData = totalData, data = Arrays.copyOfRange(msg.data, dataOffset, dataTo))
+                        appData    = appData.copy(sentSoFar = dataTo, numThisChunk = n)
+                        msg.copy(flags = flagChunked | flagDeChunk | (if(n == numChunks) flagLastChunk else 0), name="", data = Arrays.copyOfRange(msg.data, dataOffset, dataTo), appData = Some(appData))
                       }
+        if(bTransportDoChunk)debug(f"$name -- DO CHUNK -- Max1st: $maxData1st%,d, MaxNth: $maxDataNth%,d, Total: $totalData%,d, NumChunks: $numChunks ${sendMsg.strShort}")
         sendOneBuffer(sendMsg)
         dataOffset += sendMsg.data.length
       }
     }
   }
 }
-object Messaging {
+object Transport {
   // INJECT methods for debug, info, warn, error messages - default is just print to the console
   var debug:(String) => Unit = (str:String) => println(s"DEBUG: $str")
   var info:(String)  => Unit  = (str:String) => println(s" INFO: $str")
@@ -406,27 +423,32 @@ object Messaging {
   val connIDCloseAll = -1
   val connectionID   = new AtomicInteger    // Assignment of ConnectionIDs -- Server-side use only
 
-  val instrmSleepInitial = 8        // If waiting for input data, first sleep interval ... then double it
+  val instrmSleepInitial = 8        // If waiting for input data, first sleep interval ... then double it - millis
   val instrmSleepMax     = 128      // ... until exceeds this max wait time
 
   val maxMessageSize = 8 * 1024     // Larger messages must be 'chunked' into pieces
                                     // Size chosen to both reduce memory pressure and to prevent a large Message
                                     // from bottlenecking the channel. Applications should 'chunk' very large messages
-                                    // and send each chunk - so other messages may be interleaved.
+                                    // and send each chunk - so other messages may be interleaved. We will auto-chunk
+                                    // large messages if they have not been chunked by the application.
+                                    // NOTE: Fatal error to send a message which is larger than this size and also
+                                    //       marked as already chunked!
 
   val maxAutoChunk    = 20 * maxMessageSize // Arbitrary, but over this size will clog the output stream
 
   val flagInbound     = 0x01<<0     // This is an INBOUND message (i.e. it was read from the InputStream)
-  val flagChunked     = 0x01<<1     // This message has more than 1 chunk, see OnTheWireChunked
+  val flagChunked     = 0x01<<1     // This message has more than 1 chunk
   val flagDeChunk     = 0x01<<2     // Receiver should de-chunk this message before sending it to the application
-  val maskOutChunked  = (~(flagChunked | flagDeChunk)) & 0xFF   // Mask with all 'chunked' flags OFF
+  val flagFirstChunk  = 0x01<<3     // This is the first chunk
+  val flagLastChunk   = 0x01<<4     // This is the last chunk
+  val anyChunkFlag    = flagChunked | flagDeChunk | flagFirstChunk | flagLastChunk
+//  val maskOutChunked  = (~(flagChunked | flagDeChunk | flagFirstChunk | flagLastChunk)) & 0xFF   // Mask with all 'chunked' flags OFF
 
   val maskByte    = 0x00FF
   val maskInt     = 0x00FFFFFFFFL
 
   // Size & Offsets, etc to various fields within the on-the-wire buffer
   val szLength          = 4
-  val szTotalData       = 8
   val szHash            = 4
   val szFlags           = 1
   val szSzName          = 1
@@ -434,18 +456,17 @@ object Messaging {
   val szMsgID           = 4
 
   val offsetLength      = 0
-  val offsetTotalData   = offsetLength    + szLength
-  val offsetHash        = offsetTotalData + szTotalData
+  val offsetHash        = offsetLength    + szLength
   val offsetFlags       = offsetHash      + szHash
   val offsetSzName      = offsetFlags     + szFlags
   val offsetConnID      = offsetSzName    + szSzName
   val offsetMsgID       = offsetConnID    + szConnID
   val offsetName        = offsetMsgID     + szMsgID
 
-  val szBaseInfo        = szLength + szTotalData + szHash + szFlags + szSzName + szConnID + szMsgID
+  val szBaseInfo        = szLength + szHash + szFlags + szSzName + szConnID + szMsgID
 
   def offsetData(szName:Int) = offsetName + szName
-  def maxData(szName:Int)    = maxMessageSize - offsetData(szName) - szName
+  def maxData(szName:Int)    = maxMessageSize - offsetData(szName)
 
   // These messages are handled by the Messaging system itself. There is no security and/or login involved, the
   // application can require login messages (handled by the application) if desired.
@@ -459,7 +480,7 @@ object Messaging {
    *  and (optionally) send an AppConnect message to the Application
    **/
   def startConn(label:String, conn:StartConn, connections:mutable.Map[Long, ActorRef], sendToApp:Boolean = false, outbound:ActorRef=Actor.noSender) = {
-    if (bMessagingOpen) debug(s"$label ${conn.toShort}")
+    if (bTransportOpen) debug(s"$label ${conn.toShort}")
     connections.get(conn.connID) match {
       case None      => connections += (conn.connID -> conn.actorApplication)
       case Some(ref) => if (ref != conn.actorApplication) {    // If ==, have a dup message so just ignore
@@ -475,17 +496,21 @@ object Messaging {
   //       statement of the form if(flag){ .... }.
   //
   //       Change 'final val' to 'var' if you want to change these dynamically at runtime.
-  final val bMessaging         = true
-  final val bMessagingSetup    = bMessaging && true
-  final val bMessagingOpen     = bMessaging && true
-  final val bMessagingClose    = bMessaging && true
-  final val bMessagingActor    = bMessaging && true
-  final val bMessagingOutbound = bMessaging && true
-  final val bMessagingInbound  = bMessaging && true
-  final val bMessagingInDtl    = bMessaging && true
-  final val bMessagingDeChunk  = bMessaging && true
+  final val bTransport         = true
+  final val bTransportSetup    = bTransport && true
+  final val bTransportOpen     = bTransport && true
+  final val bTransportClose    = bTransport && true
+  final val bTransportActor    = bTransport && true
+  final val bTransportOutbound = bTransport && true
+  final val bTransportInbound  = bTransport && true
+  final val bTransportInDtl    = bTransport && false
+  final val bTransportDeChunk  = bTransport && false
+  final val bTransportDoChunk  = bTransport && false
+  final val bTransportSegment  = bTransport && false
+  final val bTransportRdCycle  = bTransport && false
+  final val bTransportBfrExpand= bTransport && true
 
-  final val nMessagingSleep    = 100
+  final val nTransportSleep    = 0
 }
 
 

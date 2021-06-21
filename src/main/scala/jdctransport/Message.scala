@@ -1,64 +1,72 @@
 package jdctransport
 
 import java.util.Arrays
-import akka.actor.ActorRef
+import akka.actor.{Actor, ActorRef}
 import java.nio.{ByteOrder, ByteBuffer}
 
+// Optional data which exists only within the sender - it does not go over-the-wire -- But will be included in ACK & NACK messages
+// Whether this data is populated and/or used is completely under the control of the application
+// SUGGESTED data & meaning
+case class AppData( fullMessage:Option[Message]=None,     // Recursive link to the complete Message
+                    // If data is chunked, these can be useful. Especially useful in ACKs so that
+                    // other Senders can determine if sending should be throttled until the queue is reduced
+                    totalData:Long=0,                     // Total data
+                    sentSoFar:Long=0,                     // Total data sent so far
+                    numChunks:Int=0,                      // Number of chunks
+                    numThisChunk:Int=0,                   // Number of this chunk - 1-based
+
+                    otherData:Option[Any] = None          // Catch all if Application needs additional information
+                  )
 // An original or expanded Message -- all of the numeric fields are larger to hold the unsigned number from the ByteBuffer
 // The 'asBuffer' method converts to an Array[Byte] form for transmission. See OnTheWireBuffer to parse an inbound buffer and
 // produce a Message.
 case class Message (
   // 'length', 'marker', and 'szName' are computed below
-  flags    :Int     = 0,                      // Bit flags for certain situations - see Messaging.flag... values
+  flags    :Int     = 0,                      // Bit flags for certain situations - see Transport.flag... values
   connID   :Long    = 0,                      // ID of the logical Connection to which this message belongs
-  msgID    :Long    = 0,
-  name     :String  = "",                     // KEY: Defines the type of message. Could be a class name (e.g. sdm.RespGeneric or sdm.UserLogin)
-  //      The sender & receiver must decide on all of the 'name' values and the format of the 'data'
-  //      for this a message of this name.
-  //      NOTE: String.length may NOT be the same as the Array[Byte] length if any non-Ascii
-  //            characters appear in the name
-  totalData:Long    = 0,                      // Total length of all of the 'data' - for either chunked or non-chunked messages
-  // NOTE: Can legitimately be zero - e.g. name == CloseDown, so name conveys all information
+  msgID    :Long    = 0,                      // ID of this message. Note: For chunked messages, ID will be the same for all chunks
+  name     :String  = "",                     // KEY: Defines the type of message. Could be a class name (e.g. mypackage.MyClass)
+                                              //      The sender & receiver must decide on all of the 'name' values and the format of the 'data'
+                                              //      for a message of this name. E.g. based on the 'name', the data might be a String,
+                                              //      JSON, Java object serialization, etc.
+                                              //      NOTE: String.length may NOT be the same as the Array[Byte] length if any non-Ascii
+                                              //            characters appear in the name
   data:Array[Byte]  = new Array[Byte](0),     // The actual data. For normal messages data.length == length - sizeBaseInfo - name.getBytes.length
-  // If the data was chunked, data.length == totalData if Messaging deChunked the message.
-  // Undefined if the Application receives each chunk and handles all logic.
 
-  // These are not represented in the buffer - for use only within the processing logic
-  data1stChunk:Int  = 0,                      // For normal messages == totalData, if de-chunked the length of 'data' in the first chunk
-  // (in case the application handles this differently)
-  // This is not sent on-the-wire, but established when the first part of a chunked message arrives
-  failReason:Int    = 0,                      // Problem with message if > 0, see NACK for reasons
-
-  amtSent:Long      = 0,                      // Total amount of data sent so far, useful if application is chunking a large message
-  ackTo:ActorRef    = ActorRef.noSender       // IFF provided, this Message will be sent to that Actor as an ack
+  var appData:Option[AppData] = None          // Optional application data - will be sent in all ACKs to ALL registered senders
 ) {
-  import Messaging._
-  def isPopulated  = connID != 0  && msgID != 0 && (name.nonEmpty || isChunked)
-  def isChunked    = (flags & Messaging.flagChunked) > 0
-  def isDeChunk    = (flags & Messaging.flagDeChunk) > 0
+  import Transport._
+  def isChunked    = (flags & Transport.flagChunked) > 0
+  def isDeChunk    = (flags & Transport.flagDeChunk) > 0
+  def isFirstChunk = (flags & Transport.flagFirstChunk) > 0
+  def isLastChunk  = (flags & Transport.flagLastChunk) > 0
+  def deChunk      = isChunked && (flags & Transport.flagDeChunk) > 0
   def szName       = if(name.isEmpty) 0 else name.getBytes.length
-  def length       = szBaseInfo + name.getBytes.length + data.length
-  def deChunk      = isChunked && (flags & Messaging.flagDeChunk) > 0
+  def length       = szBaseInfo + szName + data.length
   def dataAsString = new String(data)
 
-  def isInbound    = (flags & Messaging.flagInbound) > 0
+  def validChunk   = ((flags & anyChunkFlag) == 0) || isChunked     // Either all chunk flags OFF or isChunked is on (+ others maybe)
+
+  def isPopulated  = connID != 0  && msgID != 0 && (name.nonEmpty || isChunked)
+  def isValid      = isPopulated && validChunk
+
+  def isInbound    = (flags & Transport.flagInbound) > 0
   def isOutbound   = !isInbound
 
-  def strChunked = if(isChunked) s"Chunked: T, DeChunk: ${if(deChunk) "T" else "F"}," else ""
-  def strShort   = f"Message[Lnth: $length%,d,$strChunked ConnID: $connID%,d, MsgID: $msgID%,d, TotalData: $totalData%,d, DataSz: ${data.length}%,d, Name: $name]"
+  def strChunked = if(isChunked) s" Chunked: T, DeChunk: ${if(deChunk) "T" else "F"}, First: $isFirstChunk, Last: $isLastChunk," else ""
+  def strShort   = f"Message[Lnth: $length%,d,$strChunked ConnID: $connID%,d, MsgID: $msgID%,d, DataSz: ${data.length}%,d, Name: $name]"
 
-  def mustBeChunked = length > maxMessageSize
+  def mustBeChunked = length > maxMessageSize       // Transport system must chunk/de-chunk this message
 
   /** Convert this expanded information into Array[Byte] buffer form, ready to transmit */
   def asBuffer     = {
-    if(mustBeChunked)
+    if(mustBeChunked)         // Either this transport system or the application should have already chunked it
       throw new IllegalStateException(f"Message Conn: $connID%,d, MsgID: $msgID%,d, Name: $name -- must be chunked, Length: $length%,d > $maxMessageSize%,d")
     if(!isPopulated)
       throw new IllegalStateException(s"Message missing key data -- $strShort")
     val array = new Array[Byte](length)
     val bb    = ByteBuffer.wrap(array)
     bb.putInt(length)
-    bb.putLong(totalData)
     bb.putInt(0)            // Hash == 0, reset after computing the actual hash
     bb.put(flags.toByte)
     bb.put(szName.toByte)
@@ -83,14 +91,13 @@ case class Message (
  *  @param isInbound - sets as inbound/outbound - defaults to Inbound since this class is parsing a low-lever buffer
  *                     Note: Sender considers this as an Outbound message, Receiver as Inbound
  */
-case class OnTheWireBuffer( bb:ByteBuffer, isFirstChunk:Boolean = true, isInboundParam:Boolean = true ){
-  import Messaging._
+case class OnTheWireBuffer( bb:ByteBuffer, isInboundParam:Boolean = true ){
+  import Transport._
   // All of the 'val's are fields or logic which must always exist in the message
   val array        = bb.array
   val length       = bb.getInt(offsetLength)
-  val totalData    = bb.getLong(offsetTotalData)
   val hash         = bb.getInt(offsetHash).toLong & maskInt
-  val flags:Int    = (((bb.get(offsetFlags) & ~Messaging.flagInbound) | (if(isInboundParam) Messaging.flagInbound else 0)).toInt & maskByte)
+  val flags:Int    = (((bb.get(offsetFlags) & ~Transport.flagInbound) | (if(isInboundParam) Transport.flagInbound else 0)).toInt & maskByte)
   val nameSize     = bb.get(offsetSzName).toShort & maskByte
   val connID       = bb.getInt(offsetConnID).toLong & maskInt
   val msgID        = bb.getInt(offsetMsgID).toLong & maskInt
@@ -98,31 +105,34 @@ case class OnTheWireBuffer( bb:ByteBuffer, isFirstChunk:Boolean = true, isInboun
   val posData      = szBaseInfo + nameSize
   val dataLength   = (length - posData)
   val isValidLength= length >= szBaseInfo && length <= maxMessageSize       // Length is not obviously screwy
-  val isValidBfr   = bb.hasArray && bb.order==ByteOrder.BIG_ENDIAN && bb.limit >= Messaging.szBaseInfo
+  val isValidBfr   = bb.hasArray && bb.order==ByteOrder.BIG_ENDIAN && bb.limit() >= Transport.szBaseInfo
   val isValidHash  = {  // Set the in-buffer hash field to 0, compute the hash, put the original hash back
-    bb.putInt(offsetHash, 0)
-    val hashW0 = Arrays.hashCode(array)
-    bb.putInt(offsetHash, hash.toInt)
-    hashW0 == hash
-  }
+                        bb.putInt(offsetHash, 0)
+                        val hashW0 = Arrays.hashCode(array)
+                        bb.putInt(offsetHash, hash.toInt)
+                        hashW0 == hash
+                      }
   def isValid      = isValidLength && isValidBfr && isValidHash
 
-  def isInbound    = (flags & Messaging.flagInbound) > 0
+  def isInbound    = (flags & Transport.flagInbound) > 0
   def isOutbound   = !isInbound
   // These 'def's only exist if the data is chunked so compute only if needed
-  def isChunked    = (flags & Messaging.flagChunked) > 0
+  def isChunked    = (flags & Transport.flagChunked) > 0
   def notChunked   = !isChunked
-  def isDeChunk    = (flags & Messaging.flagDeChunk) > 0
+  def isFirstChunk = (flags & Transport.flagFirstChunk) > 0
+  def isLastChunk  = (flags & Transport.flagLastChunk) > 0
+  def isDeChunk    = (flags & Transport.flagDeChunk) > 0
 
   /** Return the data as an Array[Byte] - Note: dataLength may be 0 */
-  def data         = if(dataLength > 0) Arrays.copyOfRange(bb.array, posData, dataLength) else new Array[Byte](0)
+  def data         = if(dataLength > 0) Arrays.copyOfRange(bb.array, posData, posData + dataLength) else new Array[Byte](0)
 
   def fail         =if(!isValidLength) NACK.badLength
-  else if(!isValidBfr) NACK.badBuffer
-  else if(!isValidHash) NACK.badHash
-  else 0
+                    else if(!isValidBfr) NACK.badBuffer
+                    else if(!isValidHash) NACK.hashFailed
+                    else 0
+  def baseToString  = f"Length: $length%,d, ConnID: $connID%,d, MsgID: $msgID%,d, Flags: 0x$flags%X, SzName: $nameSize%d"
   /** Expand this buffer & return Message instance */
-  def asMessage   = Message(failReason = fail, flags = flags, connID = connID, msgID = msgID, name = name, totalData = totalData, data1stChunk = if(isFirstChunk) dataLength else 0, data = data)
+  def asMessage   = Message(flags = flags, connID = connID, msgID = msgID, name = name, data = data)
 }
 
 /******************************************************************************************************************/
@@ -148,11 +158,11 @@ case class OnTheWireModel (                      // sz
   szName:Byte     = 0,                      //  1  - Size of the 'name' array -- 0 == no name
   connID:Int      = 0,                      //  4  - Unique connection ID to allow multiplexing of logical connections
   msgID:Int       = 0,                      //  4  - Unique Message ID Per Connection ID and unique only in EACH DIRECTION (inbound or outbound)
-  //       since the SENDER assigns the Message ID. Note: Usually monotonic but no guarantee
-  //       Will be the same value if there are multiple 'chunks' for this message.
+                                            //       since the SENDER assigns the Message ID. Note: Usually monotonic but no guarantee
+                                            //       Will be the same value if there are multiple 'chunks' for this message.
   name:Array[Byte]= new Array[Byte](0),     //  n  - KEY: Defines the type of message. Could be a class name (e.g. sdm.RespGeneric or sdm.UserLogin)
-  //            The sender & receiver must agree on all names and decide the format of the 'data' for this type of message.
-  //            Automatic chunking sends the name only in the 1st chunk, szName == 0 in all following chunks
+                                            //            The sender & receiver must agree on all names and decide the format of the 'data' for this type of message.
+                                            //            Automatic chunking sends the name only in the 1st chunk, szName == 0 in all following chunks
   data:Array[Byte]= new Array[Byte](0)      // (length - size of other fields)
 ){
   throw new IllegalStateException("OnTheWire is for descriptive purposes ONLY, it should never be instantiated. Use OnTheWireBuffer or Message")
