@@ -2,19 +2,19 @@
 A basic low-level message transport library based on AKKA Actors.
 
 This is intended to:
-- read data from an InputStream
-- send data to an OutputStream
-- define a standard low-level buffer format for in/out streams 
-- optionally convert the input/output data to SSL
+- read data from a Channel input stream
+- send data to a Channel output stream
+- define a standard low-level buffer format for in/out streams
+- register each Connection ID that will transport over this Channel
+- optionally encrypt using public-key encryption NYI
 - convert input buffers to a high-level case class (**Message**)
 - convert a high-level Message instance to an output buffer
 - forward all inbound messages to an **Application**
-- accept Messages from the Application and send to the OutputStream
+- accept Messages from the Application and send to the Channel
 
 A **TransportActor** is the control point for a single JDCTransport system. It
-will be given the InputStream and OutputStream to process, and these should
-be exclusive to this TransportActor. It is also given a **msgIDGenerator** so
-that all messages can be assigned a unique ID.
+will be given the Channel to process, and this should be exclusive to this
+TransportActor.
 
 The TransportActor in turn will start a **TransportInActor** and a **TransportOutActor**.
 
@@ -26,7 +26,7 @@ Important concepts:
 - one JDCTransport instantiation may multiplex several ConnectionIDs
     - One **Startup** and one or more **StartConn** messages will be sent to a TransportActor
     - The same ApplicationActor may be used for each Connection, a different
-    ApplicationActor for each Connection, or any combination. This is all 
+      ApplicationActor for each Connection, or any combination. This is all 
       determined by the caller who intially created the TransportActor.
       
 # Xchange Server

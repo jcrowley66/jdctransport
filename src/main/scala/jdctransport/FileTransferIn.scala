@@ -1,0 +1,5 @@
+package jdctransport
+
+class FileTransferIn {
+
+}

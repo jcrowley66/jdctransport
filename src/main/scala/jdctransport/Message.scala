@@ -3,25 +3,28 @@ package jdctransport
 import java.util.Arrays
 import akka.actor.{Actor, ActorRef}
 import java.nio.{ByteOrder, ByteBuffer}
+import spray.json._
 
 // Optional data which exists only within the sender - it does not go over-the-wire -- But will be included in ACK & NACK messages
 // Whether this data is populated and/or used is completely under the control of the application
 // SUGGESTED data & meaning
-case class AppData( fullMessage:Option[Message]=None,     // Recursive link to the complete Message
-                    // If data is chunked, these can be useful. Especially useful in ACKs so that
-                    // other Senders can determine if sending should be throttled until the queue is reduced
+// NOTE: If include the 'fullMessage' and 'otherData' fields, spray-json cannot automatically provide to/from Json conversion
+
+case class AppData( //fullMessage:Option[Message]=None,     // Recursive link to the complete Message.
+                                                          // If data is chunked, these can be useful. Especially useful in ACKs so that
+                                                          // other Senders can determine if sending should be throttled until the queue is reduced
                     totalData:Long=0,                     // Total data
                     sentSoFar:Long=0,                     // Total data sent so far
                     numChunks:Int=0,                      // Number of chunks
                     numThisChunk:Int=0,                   // Number of this chunk - 1-based
 
-                    otherData:Option[Any] = None          // Catch all if Application needs additional information
+                    //otherData:Option[AnyRef] = None       // Catch all if Application needs additional information
                   )
 // An original or expanded Message -- all of the numeric fields are larger to hold the unsigned number from the ByteBuffer
 // The 'asBuffer' method converts to an Array[Byte] form for transmission. See OnTheWireBuffer to parse an inbound buffer and
 // produce a Message.
 case class Message (
-  // 'length', 'marker', and 'szName' are computed below
+  // 'length', 'szName' are computed below
   flags    :Int     = 0,                      // Bit flags for certain situations - see Transport.flag... values
   connID   :Long    = 0,                      // ID of the logical Connection to which this message belongs
   msgID    :Long    = 0,                      // ID of this message. Note: For chunked messages, ID will be the same for all chunks
@@ -33,9 +36,13 @@ case class Message (
                                               //            characters appear in the name
   data:Array[Byte]  = new Array[Byte](0),     // The actual data. For normal messages data.length == length - sizeBaseInfo - name.getBytes.length
 
-  var appData:Option[AppData] = None          // Optional application data - will be sent in all ACKs to ALL registered senders
+  ackTo:ActorRef    = Actor.noSender,         // For an outbound message, send ACK when this message has been transmitted
+  createdAt:Long    =System.currentTimeMillis,// When this Message was created. Can be used with the ACK time to determine how
+                                              // long it took to send an outbound Message
+  var appData:Option[AppData] = None          // Optional application data - will be sent in all ACKs
 ) {
   import Transport._
+  def isError      = (flags & Transport.flagError) > 0
   def isChunked    = (flags & Transport.flagChunked) > 0
   def isDeChunk    = (flags & Transport.flagDeChunk) > 0
   def isFirstChunk = (flags & Transport.flagFirstChunk) > 0
@@ -67,17 +74,12 @@ case class Message (
     val array = new Array[Byte](length)
     val bb    = ByteBuffer.wrap(array)
     bb.putInt(length)
-    bb.putInt(0)            // Hash == 0, reset after computing the actual hash
-    bb.put(flags.toByte)
-    bb.put(szName.toByte)
     bb.putInt(connID.toInt)
     bb.putInt(msgID.toInt)
-
+    bb.put(flags.toByte)
+    bb.put(szName.toByte)
     if(szName > 0) bb.put(name.getBytes)
     bb.put(data)
-
-    val hash = Arrays.hashCode(array)         // Compute the hash with hash field == 0, then stuff into buffer
-    bb.putInt(offsetHash, hash)
     array
   }
 }
@@ -91,12 +93,11 @@ case class Message (
  *  @param isInbound - sets as inbound/outbound - defaults to Inbound since this class is parsing a low-lever buffer
  *                     Note: Sender considers this as an Outbound message, Receiver as Inbound
  */
-case class OnTheWireBuffer( bb:ByteBuffer, isInboundParam:Boolean = true ){
+case class OnTheWireBuffer( bb:ByteBuffer, isInboundParam:Boolean = true ) extends JsonSupport {
   import Transport._
   // All of the 'val's are fields or logic which must always exist in the message
   val array        = bb.array
   val length       = bb.getInt(offsetLength)
-  val hash         = bb.getInt(offsetHash).toLong & maskInt
   val flags:Int    = (((bb.get(offsetFlags) & ~Transport.flagInbound) | (if(isInboundParam) Transport.flagInbound else 0)).toInt & maskByte)
   val nameSize     = bb.get(offsetSzName).toShort & maskByte
   val connID       = bb.getInt(offsetConnID).toLong & maskInt
@@ -106,13 +107,12 @@ case class OnTheWireBuffer( bb:ByteBuffer, isInboundParam:Boolean = true ){
   val dataLength   = (length - posData)
   val isValidLength= length >= szBaseInfo && length <= maxMessageSize       // Length is not obviously screwy
   val isValidBfr   = bb.hasArray && bb.order==ByteOrder.BIG_ENDIAN && bb.limit() >= Transport.szBaseInfo
-  val isValidHash  = {  // Set the in-buffer hash field to 0, compute the hash, put the original hash back
-                        bb.putInt(offsetHash, 0)
-                        val hashW0 = Arrays.hashCode(array)
-                        bb.putInt(offsetHash, hash.toInt)
-                        hashW0 == hash
-                      }
-  def isValid      = isValidLength && isValidBfr && isValidHash
+
+  val isError      = (flags & Transport.flagError) > 0
+
+  def getError     = if(isError) Some((new String(data)).parseJson.convertTo[Error]) else None
+
+  def isValid      = isValidLength && isValidBfr
 
   def isInbound    = (flags & Transport.flagInbound) > 0
   def isOutbound   = !isInbound
@@ -126,9 +126,8 @@ case class OnTheWireBuffer( bb:ByteBuffer, isInboundParam:Boolean = true ){
   /** Return the data as an Array[Byte] - Note: dataLength may be 0 */
   def data         = if(dataLength > 0) Arrays.copyOfRange(bb.array, posData, posData + dataLength) else new Array[Byte](0)
 
-  def fail         =if(!isValidLength) NACK.badLength
-                    else if(!isValidBfr) NACK.badBuffer
-                    else if(!isValidHash) NACK.hashFailed
+  def fail         =if(!isValidLength) NAK.badLength
+                    else if(!isValidBfr) NAK.badBuffer
                     else 0
   def baseToString  = f"Length: $length%,d, ConnID: $connID%,d, MsgID: $msgID%,d, Flags: 0x$flags%X, SzName: $nameSize%d"
   /** Expand this buffer & return Message instance */
@@ -141,7 +140,6 @@ case class OnTheWireBuffer( bb:ByteBuffer, isInboundParam:Boolean = true ){
 /******************************************************************************************************************/
 
 // NOTE: 'length' does not need to be read as unsigned since it must be <= maxMessageSize
-//       'totalData' also is not read as unsigned since it is a Long and inherently large enough
 //       If Byte, Short, Int sign bit is ON, ByteBuffer stores as negative, but retrieved as unsigned by masking
 
 // Note that frequently if 'chunked' the 'name' will appear only in the first chunk - to identify to the recipient what type of
@@ -152,14 +150,12 @@ case class OnTheWireBuffer( bb:ByteBuffer, isInboundParam:Boolean = true ){
 // The connID/msgID combination will be the mechanism for unique identification of all the related chunks.
 case class OnTheWireModel (                      // sz
   length:Int      = 0,                      //  4  - Length of this message/chunk, including this field
-  totalData:Long  = 0,                      //  8 -  Total logical size of 'data' - same as data.length in normal messages, larger if chunked
-  hash:Int        = 0,                      //  4  - hash of this message buffer computed WITH this field itself == 0
-  flags:Byte      = 0,                      //  1  - Bit flags for certain situations - see Messaging.flag... values
-  szName:Byte     = 0,                      //  1  - Size of the 'name' array -- 0 == no name
   connID:Int      = 0,                      //  4  - Unique connection ID to allow multiplexing of logical connections
   msgID:Int       = 0,                      //  4  - Unique Message ID Per Connection ID and unique only in EACH DIRECTION (inbound or outbound)
                                             //       since the SENDER assigns the Message ID. Note: Usually monotonic but no guarantee
                                             //       Will be the same value if there are multiple 'chunks' for this message.
+  flags:Byte      = 0,                      //  1  - Bit flags for certain situations - see Messaging.flag... values
+  szName:Byte     = 0,                      //  1  - Size of the 'name' array -- 0 == no name
   name:Array[Byte]= new Array[Byte](0),     //  n  - KEY: Defines the type of message. Could be a class name (e.g. sdm.RespGeneric or sdm.UserLogin)
                                             //            The sender & receiver must agree on all names and decide the format of the 'data' for this type of message.
                                             //            Automatic chunking sends the name only in the 1st chunk, szName == 0 in all following chunks
