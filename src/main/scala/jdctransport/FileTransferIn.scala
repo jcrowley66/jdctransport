@@ -1,5 +1,0 @@
-package jdctransport
-
-class FileTransferIn {
-
-}

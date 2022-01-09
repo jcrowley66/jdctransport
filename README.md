@@ -6,7 +6,6 @@ This is intended to:
 - send data to a Channel output stream
 - define a standard low-level buffer format for in/out streams
 - register each Connection ID that will transport over this Channel
-- optionally encrypt using public-key encryption NYI
 - convert input buffers to a high-level case class (**Message**)
 - convert a high-level Message instance to an output buffer
 - forward all inbound messages to an **Application**
@@ -24,7 +23,6 @@ Important concepts:
   caller and sent to the TransportActor at startup)
 - every Message is assigned a unique MessageID 
 - one JDCTransport instantiation may multiplex several ConnectionIDs
-    - One **Startup** and one or more **StartConn** messages will be sent to a TransportActor
     - The same ApplicationActor may be used for each Connection, a different
       ApplicationActor for each Connection, or any combination. This is all 
       determined by the caller who intially created the TransportActor.

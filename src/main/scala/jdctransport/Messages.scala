@@ -1,29 +1,25 @@
 package jdctransport
 
-import akka.actor.ActorRef
-
 /**
  * Once the TransportActor has been initialized, this message may be sent to define a Connection.
  *
- * @param connID            - unique ID of this connection or ZERO if not yet assigned (
- * @param actorApplication  - ref to the Actor which has the actual Application logic - where to send inbound messages
+ * @param connID  - unique ID of this connection or ZERO if not yet assigned
+ * @param app     - the Application - where to send inbound messages
  */
-final case class StartConn(connID:Long, actorApplication:ActorRef) {
-  def toShort = f"StartConn[ConnID: $connID%,d, AppActor: $actorApplication]"
+final case class StartConn(connID:Long, app:TransportApplication) {
+  def toShort = f"StartConn[ConnID: $connID%,d, App: $app]"
 }
 
 /** Message sent to the Application Actor to provide the connection information the Application will need.
  *
- * @param connID            - unique ID of this connection -- may still be ZERO in some situations, but can
- *                            still get the ActorRef of the outbound Actor and (sometimes) the msgIDGenerator
- * @param actorOutMessaging - where the Application should send outbound Message instances
- * @param channelID         - ID of the Channel so the Application can use the sendMessage(actorRef, Message, inFlight, throttleOver)
+ * @param connID    - unique ID of this connection -- may still be ZERO in some situations
+ * @param trans     - the Transport involved
  */
-final case class AppConnect(connID:Long, actorOutMessaging:ActorRef, channelID:Int){
-  def toShort = f"Messaging[ConnID: $connID%,d, OutMsg: ${System.identityHashCode(actorOutMessaging)}]"
+final case class AppConnect(connID:Long, trans:Transport){
+  def toShort = f"Messaging[ConnID: $connID%,d, OutMsg: ${trans.name}]"
 }
 /** If on the client side, connID is not yet known, so can send this to get things started */
-final case class StartClient(appActor:ActorRef)
+final case class StartClient(app:TransportApplication)
 
 /** Message sent to the TransportActor (and the In and Out Actors) to close down a particular
  *  Connection. If connID == -1, or this is the LAST active connID, then do a complete shutdown
@@ -40,17 +36,16 @@ final case class Close(connID:Long) {
  *        how many chunks are still in the queue in order to apply backpressure. The number of chunks should be
  *        minimized where possible, since these chunks may delay the sending of other Application messages.
  **/
-final case class ACK(connID:Long, msg:Message, appData:Option[AppData]=None, sentAt:Long = System.currentTimeMillis)
+final case class ACK(connID:Long, msg:TMessage, appData:Option[AppData]=None, sentAt:Long = System.currentTimeMillis)
 
-/** A NACK for an outbound message, with full Message -- sent back to the original sender only */
-final case class NAK(connID:Long, failReason:Int, msg:Message)
+/** A NACK for an outbound message, with full Message -- sent back the ackTo */
+final case class NAK(connID:Long, failReason:Int, msg:TMessage)
 
 object NAK {
-  val hashFailed    = 1
-  val badLength     = 2
-  val badBuffer     = 3                // ByteBuffer not valid - must have backing array, be big-endian, at least base size
-  val notValid      = 4
-  val badOTW        = 5                // Presented OverTheWireExpanded with key fields missing
+  val badLength     = 1
+  val badBuffer     = 2                // ByteBuffer not valid - must have backing array, be big-endian, at least base size
+  val notValid      = 3
+  val badOTW        = 4                // Presented OverTheWireExpanded with key fields missing
 }
 
 /** Standard Error message.
@@ -59,4 +54,9 @@ object NAK {
  *
  *  The msgID will be the same as the inbound message being answered or the File Transfer msgID
  **/
-final case class Error(connID:Long, msgID:Long, errCode:Int=0, errors:List[String] = Nil)
+final case class Error(connID:Long=0, msgID:Long=0, errCode:Int=0, errors:List[String] = Nil){
+  def isEmpty   = errCode==0 && errors.isEmpty
+  def nonEmpty  = !isEmpty
+
+  override def toString = if(isEmpty) "No Error" else f"ERROR[Conn: $connID%,d, MsgID: $msgID%,d, Code: $errCode, Errs: ${errors.mkString(" -- ")}]"
+}
