@@ -21,9 +21,9 @@ trait TransportApplication {
     *             may not yet have been received by the target).  **/
   def transMsgSent(msg:TMessage, trans:Transport):Unit = {}
   /** Optional -- New ConnID has been established */
-  def transConnOpen(connID:Long, trans:Transport):Unit = {}
+  def transConnOpen(connID:Int, trans:Transport):Unit = {}
   /** Optional -- but recommended. Notification that Transport has closed processing for this ConnID **/
-  def transConnClose(connID:Long, trans:Transport):Unit = {}
+  def transConnClose(connID:Int, trans:Transport):Unit = {}
 
   /********************************************************************************************************************/
   /** File Transfer operations - all are OPTIONAL if no File Transfers are initiated -- i.e. transferFile(..) called  */
@@ -189,26 +189,16 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
 
   val channelID   = assignChannelID(channel)                      // Unique ID for this Channel within this JVM
   def name        = f"Transport: $nameIn, UserID: $userAssignedID, Channel: $channelID%d"
-  val connections = mutable.Map.empty[Long, TransportApplication] // connID -> application
+  val connections = mutable.Map.empty[Int, TransportApplication]  // connID -> application
                                                                   // NOTE: will have 0 -> app created by StartClient
 
   val actorSystem = actorOpt.getOrElse(ActorSystem.create(s"Transport_${nameIn}_$channelID"))
 
   // Redirect some TMessages to an ActorRef other than the normal transMsgReceived call
   // Expected to be low-volume, mainly to redirect File Transfers
-  //                                 (ConnID, MsgID) -> ActorRef
+  //                                 msgKey -> ActorRef
   val redirects   = new TrieMap[Long, ActorRef]
 
-  /** Unique key for a message within this JVM - transient, should not be persisted */
-  def transKey(msg:TMessage):Long = if(transID <= 65535)
-                                      (transID << (32 + 16)) | msg.msgKey
-                                    else
-                                      throw new IllegalStateException(s"transID must be 16-bit unsigned, found $transID")
-  /** Unique key for a message within this JVM - transient, should not be persisted */
-  def transKey(msg:OnTheWireBuffer):Long =  if(transID <= 65535)
-                                              (transID << (32 + 16)) | msg.msgKey
-                                            else
-                                              throw new IllegalStateException(s"transID must be 16-bit unsigned, found $transID")
   /** Redirect a message if it is in the re-direct table */
   def wasReDirected(msg:TMessage):Boolean = {
     if(bTransportRedirect){
@@ -223,19 +213,19 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
   // Set a REDIRECT given a FTInfo to a different Actor
   def setRedirect(info:FTInfo, to:ActorRef):Unit = setRedirect(info.request.connID, info.xfrMsgID, to)
   // Set a REDIRECT of a connID, msgID to a different Actor
-  def setRedirect(connID:Long, msgID:Long, to:ActorRef):Unit = {
-    redirects += (((connID << 32) | msgID) -> to)
+  def setRedirect(connID:Int, msgID:Long, to:ActorRef):Unit = {
+    redirects += (((connID.toLong << 32) | msgID) -> to)
     if(bTransportRedirect) debug(s"ReDirect set ConnID: $connID, MsgID: $msgID, ActorRef: $to")
   }
   // Drop a REDIRECT given a FTInfo
   def dropRedirect(info:FTInfo):Unit = dropRedirect(info.request.connID, info.xfrMsgID)
   // Drop a REDIRECT
-  def dropRedirect(connID:Long, msgID:Long):Unit = {
+  def dropRedirect(connID:Int, msgID:Long):Unit = {
     if(bTransportRedirect){
       val ref = redirects.get((connID << 32) | msgID)
       debug(s"Remove Redirect -- ConnID: $connID, MsgID: $msgID, ActorRef: $ref")
     }
-    redirects -= ((connID << 32) | msgID)
+    redirects -= ((connID.toLong << 32) | msgID)
   }
 
   /** For each Transport, have a FileTransferDiscard actor to toss away spurious messages.
@@ -282,7 +272,7 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
                                               } else
                                                 "transAllowFT returned a False"
                                             }
-  def start(connID:Long, msgID:Long, app:TransportApplication) = {
+  def start(connID:Int, msgID:Long, app:TransportApplication) = {
     val conn = StartConn(connID, app)
     startConn(name, conn, this, sendToApp = true)
     toInAndOut(conn)
@@ -291,7 +281,7 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
     sendMessage(msg)
   }
 
-  def close(connID:Long) = {
+  def close(connID:Int) = {
     if (bTransportClose) debug(s"$name -- Closing ConnID: $connID")
     val cls = Close(connID)
     if (connID == connIDCloseAll) {
@@ -440,8 +430,8 @@ object Transport {
   val sendMinDelay    = 8                 // Minimum delay in milliseconds -- used by DelayFor trait
   val sendMaxDelay    = 128               // Maximum delay in milliseconds
 
-  val connIDBroadcast= -2L
-  val connIDCloseAll = -1L
+  val connIDBroadcast= -2
+  val connIDCloseAll = -1
   val connectionID   = new AtomicInteger    // Assignment of ConnectionIDs -- Server-side use only
 
   val actorSleepInitial = 8        // If waiting to read/write channel, first sleep interval ... then double it - millis
@@ -477,23 +467,26 @@ object Transport {
   val maskSzName    = 0x000003FF        // Mask to pick up the szName (after shift)
   val maskFlags     = 0x00CFFFFF        // Mask to pick up the Flags
   val maskByte      = 0x00FF
+  val maskShort     = 0x0000FFFF
   val maskInt       = 0x00FFFFFFFFL
 
   // Size & Offsets, etc to various fields within the on-the-wire buffer
   val szLength      = 4
-  val szConnID      = 4
+  val szTransID     = 2
+  val szConnID      = 2
   val szNameFlags   = 4
   val szMsgID       = 4
   val szAppID       = 4
 
   val offsetLength  = 0
-  val offsetConnID  = offsetLength  + szLength
+  val offsetTransID = offsetLength  + szLength
+  val offsetConnID  = offsetTransID + szTransID
   val offsetSzNFlags= offsetConnID  + szConnID
   val offsetMsgID   = offsetSzNFlags+ szNameFlags
   val offsetAppID   = offsetMsgID   + szMsgID
   val offsetName    = offsetAppID   + szAppID
 
-  val szBaseInfo    = szLength + szConnID + szNameFlags + szMsgID + szAppID
+  val szBaseInfo    = szLength + szTransID + szConnID + szNameFlags + szMsgID + szAppID
 
   // Offset to the 'data' array given the size of the 'name' field (may be zero)
   def offsetData(szName:Int) = offsetName + szName

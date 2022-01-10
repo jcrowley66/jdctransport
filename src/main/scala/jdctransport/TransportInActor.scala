@@ -44,7 +44,7 @@ class TransportInActor(trans:Transport) extends Actor with DelayFor with JsonSup
     case clt:StartClient=>if(bTransportInbound) debug(s"$name -- received StartClient")
                           if(!readCycleStarted) {
                             readCycleStarted = true
-                            trans.connections += (0L -> clt.app)
+                            trans.connections += (0 -> clt.app)
                             self ! ReadBaseInfo()
                           }
 

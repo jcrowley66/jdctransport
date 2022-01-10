@@ -24,12 +24,24 @@ case class AppData( //fullMessage:Option[Message]=None,     // Recursive link to
 /** An original or expanded Message -- all of the numeric fields are larger to hold the unsigned number from the ByteBuffer
  *  The 'asBuffer' method converts to an Array[Byte] form for transmission. See OnTheWireBuffer to parse an inbound buffer and
  *  produce a Message.
+ *
+ *  Keys
+ *  ====
+ *  The transID (16 bits) is unique within all Transports within a JVM, and is stored when a TMessage is created. Within a
+ *  JVM which receives a TMessage it is meaningless, but the transOrigKey can be used to identify the original TMessage
+ *  if sending a response back to an originator.
+ *
+ *  connID (16 bits) is unique within a Transport and should be an agreed value between two entities using Transport
+ *  to send messages to each other.
+ *
+ *  msgID (32 bits) is assigned by whichever end creates the TMessage, and the Application determines any rules.
  */
 case class TMessage (
-  trans    :Transport = null,                 // Transport with which associated
+  trans    :Transport = null,                 // Transport with which associated if CREATING a new TMessage
   // 'length', 'szName' are computed below
   flags    :Long    = 0,                      // Bit flags for certain situations - see Transport.flag... values
-  connID   :Long    = 0,                      // ID of the logical Connection to which this message belongs
+  transID  :Int     = 0,                      // TransID which originally creates the TMessage (unique within creating JVM)
+  connID   :Int     = 0,                      // ID of the logical Connection to which this message belongs.
   msgID    :Long    = 0,                      // ID of this message. Note: For chunked messages, ID will be the same for all chunks
   appMsgID :Long    = 0,                      // Optional: Application level message ID. NOTE: As UNSIGNED INT
   name     :String  = "",                     // KEY: Defines the type of message. Could be a class name (e.g. mypackage.MyClass)
@@ -51,17 +63,29 @@ case class TMessage (
 )  extends JsonSupport
 {
   import Transport._
-  /** Unique key within this JVM - transient, should not be persisted */
-  def transKey     = trans.transKey(this)
-  /** Unique key within a given transport - transient, should not be persisted */
-  def msgKey       = if(connID <= 65535)
-                       (connID << 32) | msgID
+  /** Unique key within THIS JVM - transient, should not be persisted */
+  def transThisKey = if(trans.transID <= maskShort)
+                       (trans.transID.toLong << (32 + 16)) | msgKey
                      else
-                       throw new IllegalStateException("ConnID must be 16-bit unsigned")
+                       throw new IllegalStateException(s"trans.transID must be 16-bit unsigned, had ${trans.transID}")
+
+  /** transKey from the ORIGINATOR of this TMessage (will == transThisKey if we are originator) */
+  def transOrigKey = if(transID==0)
+                       transThisKey
+                     else if(transID <= maskShort)
+                       (transID.toLong << (32 + 16)) | msgKey
+                     else
+                       throw new IllegalStateException(s"transID must be 16-bit unsigned, had ${transID}")
+
+  /** Unique key within a given transport - transient, should not be persisted */
+  def msgKey       = if(connID <= maskShort)
+                       (connID.toLong << 32) | msgID
+                     else
+                       throw new IllegalStateException(s"ConnID must be 16-bit unsigned, had $connID")
 
   override def toString = f"TMessage[Length: $length%,d, ConnID: $connID%,d, MsgID: $msgID%,d, Name: $name, appID: $appMsgID%,d, Flags: ${FError.flagNames(flags).mkString(",")}, Data: ${data.length}%,d bytes, DataStr: ${dataToString(data)}]"
-  def strChunked = if(isChunked) s" Chunked: T, DeChunk: ${if(deChunk) "T" else "F"}, First: $isFirstChunk, Last: $isLastChunk," else ""
-  def strShort   = toString   // may want this to be shorter
+  def strChunked   = if(isChunked) s" Chunked: T, DeChunk: ${if(deChunk) "T" else "F"}, First: $isFirstChunk, Last: $isLastChunk," else ""
+  def strShort     = toString   // may want this to be shorter
 
   def isError      = (flags & FError.flag) > 0
   def isChunked    = (flags & FChunked.flag) > 0
@@ -95,7 +119,8 @@ case class TMessage (
     val bb    = ByteBuffer.wrap(array)
 
     bb.putInt(length)
-    bb.putInt((connID & maskInt).toInt)
+    bb.putShort(((if(transID==0) trans.transID else transID) & maskShort).toShort)
+    bb.putShort((connID & maskShort).toShort)
     bb.putInt( ((name.length<<szNameShift) + flags ).toInt )
     bb.putInt((msgID & maskInt).toInt)
     bb.putInt((appMsgID & maskInt).toInt)
@@ -123,24 +148,25 @@ case class OnTheWireBuffer( bb      :ByteBuffer,
   import Transport._
   // The val's must be extracted since in an Xchange server this is all that is needed to forward
   // a message to the output transport. All the rest are def's so only executed if needed
-  val length        = bb.getInt(offsetLength)
-  val connID        = bb.getInt(offsetConnID).toLong & maskInt
-  val nameAndFlags  = bb.getInt(offsetSzNFlags).toLong & maskInt
+  val length       = bb.getInt(offsetLength)
+  val transID      = bb.getShort(offsetTransID).toInt & maskShort     // NOTE: TransID of original creator of this TMessage
+  val connID       = bb.getShort(offsetConnID).toInt & maskShort
+  val nameAndFlags = bb.getInt(offsetSzNFlags).toLong & maskInt
 
-  var flags         = { val rslt = (nameAndFlags & maskFlags) | (if (inbound) FInbound.flag else 0)
-                        if(bTransportOTW) debug(s"OTW - Length: $length, ConnID: $connID, Flags: ${FError.flagNamesStr(rslt)}")
-                        rslt
-                      }
   val msgID        = bb.getInt(offsetMsgID).toLong & maskInt
+  var flags        = { val rslt = (nameAndFlags & maskFlags) | (if (inbound) FInbound.flag else 0)
+                       if(bTransportOTW) debug(s"OTW - Length: $length, TransID: $transID, ConnID: $connID, MsgID: $msgID, Flags: ${FError.flagNamesStr(rslt)}")
+                       rslt
+                     }
 
   /** Unique key within a JVM - transient, should not be persisted */
-  def transKey     = if(trans.transID <= 65535)
+  def transKey     = if(trans.transID <= maskShort)
                        (trans.transID << (32 + 16)) | msgKey
                      else
                        throw new IllegalStateException(s"TransID must be 16-bit unsigned, found ${trans.transID}")
 
   /** Unique key within a given transport - transient, should not be persisted */
-  def msgKey       =  if(connID <= 65535)
+  def msgKey       =  if(connID <= maskShort)
                         (connID << 32) | msgID
                       else
                         throw new IllegalStateException(s"ConnID must be 16-bit unsigned, found $connID")
@@ -185,7 +211,7 @@ case class OnTheWireBuffer( bb      :ByteBuffer,
   def setNoChunks = flags &= ~FAnyChunk.flag
 
   /** Expand this buffer & return Message instance */
-  def asMessage   = TMessage(trans = trans, flags = flags, connID = connID, msgID = msgID, appMsgID = appMsgID, name = name, data = data)
+  def asMessage   = TMessage(trans = trans, transID = transID, flags = flags, connID = connID, msgID = msgID, appMsgID = appMsgID, name = name, data = data)
 }
 
 /******************************************************************************************************************/
@@ -200,7 +226,8 @@ case class OnTheWireBuffer( bb      :ByteBuffer,
 // message this is - and then is szName == 0 afterwards. This is an application decision.
 case class OnTheWireModel (                 // sz
   length:Int      = 0,                      //  4  - Length of this message/chunk, including this field
-  connID:Int      = 0,                      //  4  - Unique connection ID to allow multiplexing of logical connections
+  transID:Int     = 0,                      //  2  - unique transID when TMessage first created, recovered in a received TMessage
+  connID:Int      = 0,                      //  2  - Unique connection ID to allow multiplexing of logical connections in one Transport
   szName_flags:Int= 0,                      //  4  - first section contains the szName, second the Flags
   msgID:Int       = 0,                      //  4  - Unique Message ID Per Connection ID and unique only in EACH DIRECTION (inbound or outbound)
                                             //       since the SENDER assigns the Message ID. Note: Usually monotonic but no guarantee

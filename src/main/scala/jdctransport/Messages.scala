@@ -6,7 +6,7 @@ package jdctransport
  * @param connID  - unique ID of this connection or ZERO if not yet assigned
  * @param app     - the Application - where to send inbound messages
  */
-final case class StartConn(connID:Long, app:TransportApplication) {
+final case class StartConn(connID:Int, app:TransportApplication) {
   def toShort = f"StartConn[ConnID: $connID%,d, App: $app]"
 }
 
@@ -15,7 +15,7 @@ final case class StartConn(connID:Long, app:TransportApplication) {
  * @param connID    - unique ID of this connection -- may still be ZERO in some situations
  * @param trans     - the Transport involved
  */
-final case class AppConnect(connID:Long, trans:Transport){
+final case class AppConnect(connID:Int, trans:Transport){
   def toShort = f"Messaging[ConnID: $connID%,d, OutMsg: ${trans.name}]"
 }
 /** If on the client side, connID is not yet known, so can send this to get things started */
@@ -25,7 +25,7 @@ final case class StartClient(app:TransportApplication)
  *  Connection. If connID == -1, or this is the LAST active connID, then do a complete shutdown
  *  Message is also passed to the Application for that Connection (or ALL Applications)
  **/
-final case class Close(connID:Long) {
+final case class Close(connID:Int) {
   def toShort = s"Messaging Close ${if(connID == Transport.connIDCloseAll) "ALL Connections" else s"ConnID: $connID"}"
 }
 
@@ -36,10 +36,10 @@ final case class Close(connID:Long) {
  *        how many chunks are still in the queue in order to apply backpressure. The number of chunks should be
  *        minimized where possible, since these chunks may delay the sending of other Application messages.
  **/
-final case class ACK(connID:Long, msg:TMessage, appData:Option[AppData]=None, sentAt:Long = System.currentTimeMillis)
+final case class ACK(connID:Int, msg:TMessage, appData:Option[AppData]=None, sentAt:Long = System.currentTimeMillis)
 
 /** A NACK for an outbound message, with full Message -- sent back the ackTo */
-final case class NAK(connID:Long, failReason:Int, msg:TMessage)
+final case class NAK(connID:Int, failReason:Int, msg:TMessage)
 
 object NAK {
   val badLength     = 1
@@ -54,7 +54,7 @@ object NAK {
  *
  *  The msgID will be the same as the inbound message being answered or the File Transfer msgID
  **/
-final case class Error(connID:Long=0, msgID:Long=0, errCode:Int=0, errors:List[String] = Nil){
+final case class Error(connID:Int=0, msgID:Long=0, errCode:Int=0, errors:List[String] = Nil){
   def isEmpty   = errCode==0 && errors.isEmpty
   def nonEmpty  = !isEmpty
 

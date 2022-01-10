@@ -47,7 +47,7 @@ final case class FTAppData (
  *  except the isInbound flag will be set as needed when passed to the other transport.
  **/
 final case class FTRequest(
-    connID:Long             = -1,           // connID for this transfer
+    connID:Int              = -1,           // connID for this transfer - must be 16-bit unsigned value
     appFileName:String      = "",           // May be absolute, relative, or anything else. The TransferApplication
                                             // transFTOutboundPath and transFTInboundPath must be able to interpret
                                             // and return an absolute Path
