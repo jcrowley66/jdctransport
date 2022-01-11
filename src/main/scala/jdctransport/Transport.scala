@@ -2,11 +2,12 @@ package jdctransport
 
 import java.nio.file._
 import java.nio.channels._
-import java.util.{ArrayDeque}
+import java.util.ArrayDeque
 import scala.concurrent.duration.Duration
 import java.util.concurrent.TimeUnit.MILLISECONDS
 import java.util.concurrent.atomic._
 import akka.actor.{Props, ActorContext, Actor, ActorSystem, ActorRef}
+import jdctransport.Transport.{defaultBackpressureLow, defaultFTBackpressureLow, defaultBackpressureHigh, defaultFTBackPressureHigh}
 
 import scala.collection.mutable
 import scala.collection.concurrent.TrieMap
@@ -149,6 +150,7 @@ private final case class CheckQueue()    extends TransportStep  // Used by Appli
 private final case class FTXfrN()        extends TransportStep  // Used by File Transfer actors
 private final case class FTClear()       extends TransportStep
 
+// FIXME - Transport should really extend from SendMessageTrait in order to implement backpressure
 /**
  * One Transport handles a single SocketChannel, and this should not be touched outside of
  * that Transport or everything will probably break!
@@ -175,9 +177,18 @@ private final case class FTClear()       extends TransportStep
  * @param maxOutCnt - Maximum queued outbound TMessages - if exceeded, 'sendMessage' will BLOCK
  *                    NOTE: If a long message is broken into N chunks, will count as N messages here
  * @param maxOutData- Maximum queued outbound data (total length) of TMessages - if exceeded, 'sendMessage' will BLOCK
+ *
+ * @param backPressureHigh    - If the number in flight exceeds this value, then queue all new send requests. 0==infinity - NO backpressure
+ * @param backPressureLow     - ... until the number in flight falls below this number
+ * @param FTBackPressureHigh  - Different high/low backpressure limits for File Transfers so that a large FT does not crowd
+ * @param FTBackPressureLow   - ... out the transfer of normal messages. Normally lower limits for both high & low
  * @param actorOpt  - caller may provide the ActorSystem. If none, then one is created for this Transport
  */
-class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportApplication, val actorOpt:Option[ActorSystem]=None, maxOutCnt:Int=Int.MaxValue, maxOutData:Long=Long.MaxValue) {
+class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportApplication, val actorOpt:Option[ActorSystem]=None,
+                val maxOutCnt:Int=Int.MaxValue, val maxOutData:Long=Long.MaxValue,
+                val backPressureHigh:Int = defaultBackpressureHigh, val backPressureLow:Int = defaultBackpressureLow,
+                val FTBackPressureHigh: Int = defaultFTBackPressureHigh, val FTBackPressureLow:Int = defaultFTBackpressureLow
+) {
   import Transport._
 
   val transID     = assignTransID                 // Unique ID (within a single JVM) for this Transport, must be within 16 bits (unsigned)
@@ -352,30 +363,30 @@ trait SendMessageTrait extends DelayFor {
   def trans:Transport
 
   // Logic - when the inFlight count is > maxInFlight, then enter backpressure mode and just queue all messages
-  val minInFlight = Transport.defaultBackpressureLow      // 0 == no min, start sending again as soon as below maxInFlight
-                                                          // n == start sending when actual in-flight < n
-                                                          //      Note: n == 1 means start sending when 0 in-flight
-  val maxInFlight = Transport.defaultBackpressureHigh     // 0 == NO backpressure
+  def minInFlight:Int     // 0 == no min, start sending again as soon as below maxInFlight
+                          // n == start sending when actual in-flight < n
+                          //      Note: n == 1 means start sending when 0 in-flight
+  def maxInFlight:Int     // 0 == NO backpressure
 
-  var isInBackpressure = false
+  private var isInBackpressure = false
 
   // Queue of Message's to be sent. Messages added here if handling back-pressure
-  val queue    = new ArrayDeque[TMessage]()
+  private val queue    = new ArrayDeque[TMessage]()
 
   private def addToQueue(msg:TMessage)  = queue.add(msg)
 
-  private def sendMessage(msg:TMessage) = {
+  protected def internalSendMessage(msg:TMessage) = {
     addToQueue(msg)
-    sendQueued
+    internalSendQueued
   }
 
-  def sendQueued:Unit = {
+  protected def internalSendQueued:Unit = {
     // Send one message from the Q, and call again to check the next one
     def sendOne = if (!queue.isEmpty) {
                           val msg = queue.poll
                           trans.outbound ! msg
                           delayReset
-                          sendQueued
+                          internalSendQueued
                         }
 
     // If have messages, check against any backpressure rules & send if OK

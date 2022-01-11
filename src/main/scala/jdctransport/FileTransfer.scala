@@ -143,13 +143,10 @@ class FileTransferOut(val trans:Transport, var info:FTInfo) extends Actor with J
   val actorContext  = context
   val actorSelf     = self
   val app           = trans.app
-
-  override
-  val minInFlight   = defaultFTBackpressureLow
-  override
-  val maxInFlight   = defaultFTBackPressureHigh         // NOTE: within THIS logic, also stops reading if > this
-                                                        //       number of Messages in the SendMessage Q so that we
-                                                        //       do not throw OOM
+  val minInFlight   = trans.FTBackPressureLow
+  val maxInFlight   = trans.FTBackPressureHigh  // NOTE: within THIS logic, also stops reading if > this
+                                                //       number of Messages in the SendMessage Q so that we
+                                                //       do not throw OOM
   /////////// End of variables injected into SendMessage & DelayFor traits /////////////
 
   val path                 = {  val (pathOpt, appOpt) = app.transFTOutboundPath(trans, info)
@@ -240,7 +237,7 @@ class FileTransferOut(val trans:Transport, var info:FTInfo) extends Actor with J
 
     case ack:ACK          => if(bFTOutReceive) debug(s"$name ACK: $ack")
                              if(ack.msg.msgID==info.xfrMsgID) {
-                               sendQueued
+                               internalSendQueued
                              }
 
     case nak:NAK          =>error(s"$name NAK ${nak.failReason}")
@@ -248,7 +245,7 @@ class FileTransferOut(val trans:Transport, var info:FTInfo) extends Actor with J
                             context.stop(self)
 
     case _:CheckQueue     => if(bFTOutReceive) debug(s"$name CheckQueue" )
-                             sendQueued               // Handle back-pressure
+                             internalSendQueued               // Handle back-pressure
 
     case _:FTClear        => if(bFTOutReceive) debug(s"$name FTClear")
                              // Clear any queued messages, then stop
@@ -256,7 +253,7 @@ class FileTransferOut(val trans:Transport, var info:FTInfo) extends Actor with J
                                 info = stopThisEnd(true, StageDone, trans, info)
                                 context.stop(self)
                               } else {
-                                sendQueued
+                                internalSendQueued
                                 delayFor(FTClear())   // We're at end, so just spin until Q is empty
                               }
 
@@ -277,7 +274,7 @@ class FileTransferOut(val trans:Transport, var info:FTInfo) extends Actor with J
                                          if(!info.request.isGrowing){
                                             val flags= msg.flags | (if(numSent==0) FFirstChunk.flag else 0) | (if(info.request.isGrowing) 0 else FLastChunk.flag)
                                             val data = if(buffer.position() > 0) Arrays.copyOf(bfr, buffer.position()) else new Array[Byte](0)
-                                            sendMessage(msg.copy(flags = flags , data = data))
+                                            internalSendMessage(msg.copy(flags = flags , data = data))
                                             self ! FTClear()
                                          } else
                                            delayFor(ReadRemaining())  // Doing isGrowing, so take this as a false EOF until more data added to source file
@@ -288,7 +285,7 @@ class FileTransferOut(val trans:Transport, var info:FTInfo) extends Actor with J
                                           if(numSent==0) msg = msg.copy(flags = msg.flags | FFirstChunk.flag)
                                           if(!info.request.isGrowing && numSent + 1 == chunksTtl) msg = msg.copy(flags = msg.flags | FLastChunk.flag)
                                           if(bFTOutMsg) debug(s"$name MSG: ${msg.strShort}")
-                                          sendMessage(msg.copy(data = Arrays.copyOf(bfr, buffer.position)))
+                                          internalSendMessage(msg.copy(data = Arrays.copyOf(bfr, buffer.position)))
                                           numSent += 1
                                           if(info.request.isGrowing || numSent < chunksTtl)
                                             self ! FTXfrN()
