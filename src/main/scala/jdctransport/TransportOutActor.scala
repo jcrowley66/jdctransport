@@ -21,8 +21,8 @@ class TransportOutActor(trans:Transport ) extends Actor with DelayFor {
 
 
   val queue           = new ArrayDeque[TMessage]()        // Queue of Message's to be sent. Need to keep this
-  // since new Message's can arrive while we're still
-  // writing earlier ones.
+                                                          // since new Message's can arrive while we're still
+                                                          // writing earlier ones.
 
   var nullCycles      = 0          // Count of null write cycles (nothing to write)
 
@@ -50,9 +50,14 @@ class TransportOutActor(trans:Transport ) extends Actor with DelayFor {
                           }
                           if(!msg.isValid)
                             sender ! NAK(msg.connID, NAK.notValid, msg)
-                          else if (msg.length > Transport.maxMessageSize)
+                          else if (msg.length > Transport.maxMessageSize) {
+                            // Adjust the counters since they were bumped before sending msg here
+                            // Each chunk will be considered another message within sendChunks
+                            trans.outboundCnt.decrementAndGet
+                            trans.outboundData.addAndGet(-msg.length)
                             sendChunks(msg)
-                          else {
+                          } else {
+                            trans.inFlight.incrementAndGet
                             queue.add(msg)
                           }
 
@@ -92,6 +97,8 @@ class TransportOutActor(trans:Transport ) extends Actor with DelayFor {
     amtWritten += n
     if(bTransportOutDtl) { if(n > 0) debug(f"$name -- doWrite N: $n%,d, AmtWritten: $amtWritten%,d, Length: $length%,d") }
     if(amtWritten==length){
+      trans.outboundCnt.decrementAndGet
+      trans.outboundData.addAndGet(-length)
       trans.inFlight.decrementAndGet
       if( message.isPartOfFT==false || trans.app.transSuppressFileTransferToMsg==false )
         trans.app.transMsgSent(message, trans)
@@ -129,21 +136,20 @@ class TransportOutActor(trans:Transport ) extends Actor with DelayFor {
 
       var appData    = AppData(totalData = totalData, sentSoFar = maxData1st, numChunks=numChunks, numThisChunk = 1)
       var dataOffset = 0
-      trans.inFlight.addAndGet(numChunks - 1)       // ASSUME that the sender added 1 for the overall Message
       for(n <- 1 to numChunks){
         val sendMsg = if(n == 1) {
-          val rslt = msg.copy(flags = msg.flags | FChunked.flag | FDeChunk.flag | FFirstChunk.flag, data = Arrays.copyOfRange(msg.data, 0, maxData1st), appData = Some(appData))
-          queue.add(rslt)
-          rslt
-        } else {
-          val fullTo = dataOffset + maxDataNth
-          val dataTo = if(fullTo > msg.data.length) msg.data.length else fullTo
-          appData    = appData.copy(sentSoFar = dataTo, numThisChunk = n)
-          val rslt = msg.copy(flags = msg.flags | FChunked.flag | FDeChunk.flag | (if(n == numChunks) FLastChunk.flag else 0), name="", data = Arrays.copyOfRange(msg.data, dataOffset, dataTo), appData = Some(appData))
-          queue.add(rslt)
-          rslt
-        }
+                        msg.copy(flags = msg.flags | FChunked.flag | FDeChunk.flag | FFirstChunk.flag, data = Arrays.copyOfRange(msg.data, 0, maxData1st), appData = Some(appData))
+                      } else {
+                        val fullTo = dataOffset + maxDataNth
+                        val dataTo = if(fullTo > msg.data.length) msg.data.length else fullTo
+                        appData    = appData.copy(sentSoFar = dataTo, numThisChunk = n)
+                        msg.copy(flags = msg.flags | FChunked.flag | FDeChunk.flag | (if(n == numChunks) FLastChunk.flag else 0), name="", data = Arrays.copyOfRange(msg.data, dataOffset, dataTo), appData = Some(appData))
+                      }
         if(bTransportDoChunk)debug(f"$name -- DO CHUNK -- Max1st: $maxData1st%,d, MaxNth: $maxDataNth%,d, Total: $totalData%,d, NumChunks: $numChunks ${sendMsg.strShort}")
+        trans.outboundCnt.incrementAndGet
+        trans.outboundData.addAndGet(sendMsg.length)
+        trans.inFlight.incrementAndGet
+        queue.add(sendMsg)
         dataOffset += sendMsg.data.length
       }
     }

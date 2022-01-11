@@ -172,9 +172,12 @@ private final case class FTClear()       extends TransportStep
  * @param app       - callback methods to the Application NOTE: Sometimes set to NULL initially because need to
  *                    create both the Application and Transport and we have a chicken-and-egg problem. So set
  *                    this to NULL, then immediately inject the correct TransportApplication.
+ * @param maxOutCnt - Maximum queued outbound TMessages - if exceeded, 'sendMessage' will BLOCK
+ *                    NOTE: If a long message is broken into N chunks, will count as N messages here
+ * @param maxOutData- Maximum queued outbound data (total length) of TMessages - if exceeded, 'sendMessage' will BLOCK
  * @param actorOpt  - caller may provide the ActorSystem. If none, then one is created for this Transport
  */
-class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportApplication, val actorOpt:Option[ActorSystem]=None) {
+class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportApplication, val actorOpt:Option[ActorSystem]=None, maxOutCnt:Int=Int.MaxValue, maxOutData:Long=Long.MaxValue) {
   import Transport._
 
   val transID     = assignTransID                 // Unique ID (within a single JVM) for this Transport, must be within 16 bits (unsigned)
@@ -254,11 +257,19 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
   val inbound = actorSystem.actorOf(Props(new TransportInActor(this)))
   /////////////////////////////////
 
-  val inFlight = new AtomicInteger          // Total in-flight outbound messages (so apps can throttle if needed)
-                                            // Application (or SendMessage trait) bumps, outbound actor decrements
+  val outboundCnt = new AtomicInteger     // Total outbound messages (so apps can throttle if needed)
+                                          // Application (or SendMessage trait) bumps, outbound actor decrements
+  val outboundData= new AtomicLong()      // Total data (length of all TMessages)
+  val inFlight    = new AtomicInteger()   // Count of # passed to TransportOutActor - used for backpressure
 
-  /** Send a Message */
-  def sendMessage(msg:TMessage):Unit = outbound ! msg
+  def sendMessageWillBlock = outboundCnt.get > maxOutCnt || outboundData.get > maxOutData
+  /** Send a Message -- will block if max in-flight count or data is already exceeded */
+  def sendMessage(msg:TMessage):Unit ={
+                                        while(sendMessageWillBlock) threadSleep(50)
+                                        outboundCnt.incrementAndGet             // Adjusted if msg must be auto-chunked
+                                        outboundData.addAndGet(msg.length)      // ditto
+                                        outbound ! msg
+                                      }
   /** Execute a File Transfer - Note: the transFTInboundPath and transFTInboundDone must be provided by the Application
    *                                  on the inbound side of this transfer.
    *  @return empty if OK, else an error message
@@ -351,9 +362,9 @@ trait SendMessageTrait extends DelayFor {
   // Queue of Message's to be sent. Messages added here if handling back-pressure
   val queue    = new ArrayDeque[TMessage]()
 
-  def addToQueue(msg:TMessage)  = queue.add(msg)
+  private def addToQueue(msg:TMessage)  = queue.add(msg)
 
-  def sendMessage(msg:TMessage) = {
+  private def sendMessage(msg:TMessage) = {
     addToQueue(msg)
     sendQueued
   }
@@ -361,11 +372,11 @@ trait SendMessageTrait extends DelayFor {
   def sendQueued:Unit = {
     // Send one message from the Q, and call again to check the next one
     def sendOne = if (!queue.isEmpty) {
-                    trans.inFlight.incrementAndGet
-                    trans.outbound ! queue.poll
-                    delayReset
-                    sendQueued
-                  }
+                          val msg = queue.poll
+                          trans.outbound ! msg
+                          delayReset
+                          sendQueued
+                        }
 
     // If have messages, check against any backpressure rules & send if OK
     if (!queue.isEmpty) {
@@ -419,6 +430,13 @@ object Transport {
       case Some(id) => id
     }
   }
+
+  /** Thread.sleep but just returns on an InterruptedException */
+  def threadSleep(millis:Long) =  try{
+                                    Thread.sleep(millis)
+                                  } catch {
+                                    case _:InterruptedException => // no-op
+                                  }
 
   val defaultBackpressureLow  = 3         // Defaults used in the SendMessage trait
   val defaultBackpressureHigh = 8

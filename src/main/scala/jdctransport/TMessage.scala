@@ -87,6 +87,7 @@ case class TMessage (
   def strChunked   = if(isChunked) s" Chunked: T, DeChunk: ${if(deChunk) "T" else "F"}, First: $isFirstChunk, Last: $isLastChunk," else ""
   def strShort     = toString   // may want this to be shorter
 
+  def isToXchange  = (flags & FToXchange.flag) > 0                // TMessage is directed to an Xchange server
   def isError      = (flags & FError.flag) > 0
   def isChunked    = (flags & FChunked.flag) > 0
   def isDeChunk    = (flags & FDeChunk.flag) > 0
