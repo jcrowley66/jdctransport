@@ -1,44 +1,66 @@
 package jdctransport
 
+import java.nio.{Buffer, ByteBuffer}
 import java.nio.file._
 import java.nio.channels._
 import java.util.ArrayDeque
 import scala.concurrent.duration.Duration
+import java.util.concurrent._
 import java.util.concurrent.TimeUnit.MILLISECONDS
 import java.util.concurrent.atomic._
 import akka.actor.{Props, ActorContext, Actor, ActorSystem, ActorRef}
-import jdctransport.Transport.{defaultBackpressureLow, defaultFTBackpressureLow, defaultBackpressureHigh, defaultFTBackPressureHigh}
+import jdccommon.JDCFlagsCodes
+import jdctransport.Transport._
 
-import scala.collection.mutable
 import scala.collection.concurrent.TrieMap
 
 /** Trait must be supported by the Application. Required methods must be supplied by the Application.
  *  Optional methods may be overridden if desired, otherwise default to no-ops */
 trait TransportApplication {
   /** REQUIRED -- Message has been received (note, may be part of a file transfer, see transSuppressFileTransfer)
-    *             The application should dispatch this to the correct handling method or Actor **/
-  def transMsgReceived(msg:TMessage, tran:Transport)
-  /** Optional -- Message passed to transMsgSend(..) has physically been sent (Note: passed to the outbound socket, it
-    *             may not yet have been received by the target).  **/
-  def transMsgSent(msg:TMessage, trans:Transport):Unit = {}
+    *             The application should dispatch this to the correct handling method **/
+  def transMsgReceived(msg:TransMessage, tran:Transport) = {}
+
+  /** Optional -- application name for this App/Transport - used only in some log messages */
+  def transAppName:String = "(NoName)"
+
   /** Optional -- New ConnID has been established */
   def transConnOpen(connID:Int, trans:Transport):Unit = {}
-  /** Optional -- but recommended. Notification that Transport has closed processing for this ConnID **/
-  def transConnClose(connID:Int, trans:Transport):Unit = {}
 
+  /** Optional -- notification that this Transport has closed -- will return Exception if closed because of error
+   * @param connID -- individual connID that was closed or 'connIDAll' it entire Transport has been closed
+   **/
+  def transClosed(connID:Int, trans:Transport, ex:Option[Exception] = None) = {}
+
+  /** Optional -- determines whether Transport de-chunks inbound messages or returns chunks directly to the application
+   *           -- large outbound messages will always be chunked
+   *           -- per-message
+   ****/
+  def transSkipDeChunk():Boolean = false
+  /** Optional -- Message passed to transMsgSend(..) has physically been sent (Note: passed to the outbound socket, it
+    *             may not yet have been received by the target).  **/
+  def transMsgSent(msg:OTWMessage, trans:Transport):Unit = {
+    if(bTransportTrace) debugTrace(s"TransMsgSent-${this.getClass.getName}", msg, trans)
+  }
+
+  /** Optional -- Override if the application has defined additional TFlag values (see TMessage) */
+  def transAllTFlags:List[TFlag] = TFError.allTFlags
   /********************************************************************************************************************/
   /** File Transfer operations - all are OPTIONAL if no File Transfers are initiated -- i.e. transferFile(..) called  */
   /**                                                                                                                 */
   /** Note: If any method returns an Option[FTAppData] that is non-empty, that instance will replace the current      */
   /**       instance within the FTInfo instance.                                                                      */
   /********************************************************************************************************************/
-  /** Optional -- MUST override to allow File Transfers -- determine if this File Transfer is supported by the Application.  */
+  /** Optional -- MUST override to allow File Transfers -- determine if this File Transfer is supported by the Application.
+   *              NOTE: May be given an empty FTInfo just to get a general yes/no.
+   **/
   def transAllowFT(info:FTInfo):(Boolean, Option[FTAppData]) = (false, None)
+  /** Optional -  Return TRUE if application handled the FTStart, if FALSE then Transport handles it
+   *              NOTE: Invoked only if transAllowFT returned a (true, _)
+   **/
+  def transFTStartHandled(info:FTInfo, msg:TransMessage):Boolean = false
   /** Optional -- terminate the transfer of data -- usually for an isGrowing=true file */
   def transStopTransfer(info:FTInfo):Unit = {}
-  /** Optional -- whether to send or suppress File Transfer TMessages to transMsgReceived & transMsgSent. Normally suppressed.
-   *              Note: Transport wide suppression since at the point of call there is no way to determine which FT this might be. **/
-  def transSuppressFileTransferToMsg:Boolean = true
   /** REQUIRED IFF an outbound file transfer occurs, return full path of the file to read & transfer
    *  If None is returned for the Path, file transfer is aborted.  **/
   def transFTOutboundPath(trans:Transport, info:FTInfo):(Option[Path], Option[FTAppData]) = (None, None)
@@ -50,8 +72,12 @@ trait TransportApplication {
   /** Optional - but recommended. Signals that an inbound file transfer is complete and file has
     * been written to the Path returned by transFTInboundPath. Note: Check 'info' to determine if any error. **/
   def transFTInboundDone(trans:Transport, info:FTInfo):Unit = {}
-  /** Optional -- Invoked during the stages of a file transfer - see values in object FileInfo. **/
-  def transFTStages(trans:Transport, info:FTInfo):Option[FTAppData] = None
+  /** Optional -- Invoked during the stages of a file transfer - see values in object FTInfo. **/
+  def transFTStages(trans:Transport, info:FTInfo):Unit = {}
+  /** Optional -- called on each file transfer segment sent */
+  def transFTSent(trans:Transport, info:FTInfo, msg:TransMessage):Unit = {}
+  /** Optional -- called on each file transfer segment received **/
+  def transFTReceived(trans:Transport, info:FTInfo, msg:TransMessage):Unit = {}
 }
 /** This is a low-level messaging system between two applications. More importantly, it can be
  *  routed through an Xchange server so that applications with non-routable IP addresses can both
@@ -138,7 +164,7 @@ trait TransportApplication {
  */
 
 // Used by several Actors to form a state machine so nothing ever blocks.
-// Also passed to the SleepFor logic to delay & SendMessage traits
+// Also passed to the DelayFor logic to delay & SendMessage traits
 sealed trait TransportStep         // NOTE: This is used in several different classes
 private final case class ReadBaseInfo() extends TransportStep   // A read - just get the base information
 private final case class ReadBaseMore() extends TransportStep   // Read the rest of the base information
@@ -149,8 +175,19 @@ private final case class WriteMore()    extends TransportStep   // ... continue 
 private final case class CheckQueue()    extends TransportStep  // Used by Application Actors with the SendMessage trait
 private final case class FTXfrN()        extends TransportStep  // Used by File Transfer actors
 private final case class FTClear()       extends TransportStep
+/** Message sent to the TransportActor (and the In and Out Actors) to close down a particular
+ *  Connection. If connID == -1, or this is the LAST active connID, then do a complete shutdown
+ *  Message is also passed to the Application for that Connection (or ALL Applications)
+ *  @param connID    - connID to close or
+ *  @param clearOutQ - False == outbound actor should send all Queued messages, then close the connection
+ *                     True  == drop any messages in the Queue for this connID
+ *  @param processedAgain - True == we already processed any messages already in the Q, so time to close up shop
+ *  @param andShutdown    - True == IFF there are no more active ConnIDs, then shut down the transport
+ **/
+final case class Close(connID:Int, clearOutQ:Boolean = false, andShutdown:Boolean = false, ex:Option[String] = None) extends TransportStep {
+  def toShort = s"Close[ConnID: ${if(connID == Transport.connIDAll) "ALL Connections" else s"ConnID: $connID"}, ClearQ: $clearOutQ]"
+}
 
-// FIXME - Transport should really extend from SendMessageTrait in order to implement backpressure
 /**
  * One Transport handles a single SocketChannel, and this should not be touched outside of
  * that Transport or everything will probably break!
@@ -169,7 +206,10 @@ private final case class FTClear()       extends TransportStep
  * NOTE: MsgID's generated on the SERVER are even-numbered, on the CLIENT odd-numbered. The msgID generator for
  *       a Client is created when the 'msgConnectionCreated' is received during establishment of the connection.
  *
- * @param name      - Name for this transport system. Used only for user messages (debug, info, warn, error)
+ * NOTE: After a new Transport(....) and any other setup, you must call the start(....) method!
+ *
+ * @param nameIn    - User specified name for this transport system. Used for Actor names & user messages (debug, info, warn, error)
+ *                    NOTE: Must contain only [a-zA-Z0-9] plus non-leading '-' or '_'
  * @param channel   - the SocketChannel to be handled
  * @param app       - callback methods to the Application NOTE: Sometimes set to NULL initially because need to
  *                    create both the Application and Transport and we have a chicken-and-egg problem. So set
@@ -186,12 +226,28 @@ private final case class FTClear()       extends TransportStep
  */
 class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportApplication, val actorOpt:Option[ActorSystem]=None,
                 val maxOutCnt:Int=Int.MaxValue, val maxOutData:Long=Long.MaxValue,
-                val backPressureHigh:Int = defaultBackpressureHigh, val backPressureLow:Int = defaultBackpressureLow,
+                val backPressureHigh  :Int = defaultBackpressureHigh, val backPressureLow:Int = defaultBackpressureLow,
                 val FTBackPressureHigh: Int = defaultFTBackPressureHigh, val FTBackPressureLow:Int = defaultFTBackpressureLow
 ) {
   import Transport._
 
+  override def toString = toShort
+
+  def toShort           = s"Transport[$name $transID/$channelID --> ${channel.getRemoteAddress.toString}, Started: $started]"
+
   val transID     = assignTransID                 // Unique ID (within a single JVM) for this Transport, must be within 16 bits (unsigned)
+  val channelID   = assignChannelID               // Unique ID for this Channel within this JVM
+
+  val transChnlID = s"$transID/$channelID"
+
+  @volatile
+  private[jdctransport] var _inIsClosed = false
+  @volatile
+  private[jdctransport] var _outIsClosed = false
+
+  def isClosed = _inIsClosed && _outIsClosed
+
+  Transport.allTransports += (transID -> this)    // Add to global list of active Transports
 
   private var userAssignedID = 0
   /** User can assign a user-specific ID, but only once (to make sure it stays unique) */
@@ -201,12 +257,22 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
     else                     throw new IllegalStateException(s"assignUserID can only be called once!")
   }
 
-  val channelID   = assignChannelID(channel)                      // Unique ID for this Channel within this JVM
-  def name        = f"Transport: $nameIn, UserID: $userAssignedID, Channel: $channelID%d"
-  val connections = mutable.Map.empty[Int, TransportApplication]  // connID -> application
-                                                                  // NOTE: will have 0 -> app created by StartClient
+  def name        = f"Transport: $nameIn - $transID/$channelID"
+  val connections = new TrieMap[Int, (Boolean, TransportApplication)]()   // connID -> (true if closed, application)
+                                                                            // NOTE: will have 0 -> app created by StartClient
 
-  val actorSystem = actorOpt.getOrElse(ActorSystem.create(s"Transport_${nameIn}_$channelID"))
+  /** Define a ConnID, return None if is not already defined, previous App if this is a redefine */
+  def defineConnID(connID:Int, app:TransportApplication):Option[(Boolean, TransportApplication)] = {
+    connections.get(connID) match {
+      case None                   => connections += (connID -> (false, app))
+                                     None
+      case Some((closed, oldApp)) => info(s"Trans $name, ConnID: $connID switching from ${oldApp.transAppName} to ${app.transAppName}")
+                                     connections += (connID -> (false, app))
+                                     Some((closed, oldApp) )
+    }
+  }
+
+  val actorSystem = actorOpt.getOrElse(ActorSystem.create(s"Trans_$channelID"))
 
   // Redirect some TMessages to an ActorRef other than the normal transMsgReceived call
   // Expected to be low-volume, mainly to redirect File Transfers
@@ -214,7 +280,7 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
   val redirects   = new TrieMap[Long, ActorRef]
 
   /** Redirect a message if it is in the re-direct table */
-  def wasReDirected(msg:TMessage):Boolean = {
+  def wasReDirected(msg:OTWMessage):Boolean = {
     if(bTransportRedirect){
       debug(s"Redirect Contents -- ${redirects.keySet.mkString(", ")}")
       debug(s"${if(redirects.get(msg.msgKey).isEmpty) " No" else "YES"} Redirect Msg -- ${msg.strShort}")
@@ -228,7 +294,7 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
   def setRedirect(info:FTInfo, to:ActorRef):Unit = setRedirect(info.request.connID, info.xfrMsgID, to)
   // Set a REDIRECT of a connID, msgID to a different Actor
   def setRedirect(connID:Int, msgID:Long, to:ActorRef):Unit = {
-    redirects += (((connID.toLong << 32) | msgID) -> to)
+    redirects += ( redirectKey(connID, msgID) -> to)
     if(bTransportRedirect) debug(s"ReDirect set ConnID: $connID, MsgID: $msgID, ActorRef: $to")
   }
   // Drop a REDIRECT given a FTInfo
@@ -236,10 +302,10 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
   // Drop a REDIRECT
   def dropRedirect(connID:Int, msgID:Long):Unit = {
     if(bTransportRedirect){
-      val ref = redirects.get((connID << 32) | msgID)
+      val ref = redirects.get(redirectKey(connID, msgID))
       debug(s"Remove Redirect -- ConnID: $connID, MsgID: $msgID, ActorRef: $ref")
     }
-    redirects -= ((connID.toLong << 32) | msgID)
+    redirects -= redirectKey(connID, msgID)
   }
 
   /** For each Transport, have a FileTransferDiscard actor to toss away spurious messages.
@@ -264,8 +330,8 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
   // ---- Executed at instantiation
   if(bTransportOpen) debug(s"$name STARTING -- Channel: $channelID")
   if(channel.isBlocking) throw new IllegalStateException(s"$name -- SocketChannel must be in non-blocking mode")
-  val outbound= actorSystem.actorOf(Props(new TransportOutActor(this)))
-  val inbound = actorSystem.actorOf(Props(new TransportInActor(this)))
+  private[jdctransport] val outbound= actorSystem.actorOf(Props(new TransportOutActor(this)))
+  private[jdctransport] val inbound = actorSystem.actorOf(Props(new TransportInActor(this)))
   /////////////////////////////////
 
   val outboundCnt = new AtomicInteger     // Total outbound messages (so apps can throttle if needed)
@@ -274,46 +340,115 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
   val inFlight    = new AtomicInteger()   // Count of # passed to TransportOutActor - used for backpressure
 
   def sendMessageWillBlock = outboundCnt.get > maxOutCnt || outboundData.get > maxOutData
+
   /** Send a Message -- will block if max in-flight count or data is already exceeded */
-  def sendMessage(msg:TMessage):Unit ={
-                                        while(sendMessageWillBlock) threadSleep(50)
-                                        outboundCnt.incrementAndGet             // Adjusted if msg must be auto-chunked
-                                        outboundData.addAndGet(msg.length)      // ditto
-                                        outbound ! msg
-                                      }
-  /** Execute a File Transfer - Note: the transFTInboundPath and transFTInboundDone must be provided by the Application
-   *                                  on the inbound side of this transfer.
-   *  @return empty if OK, else an error message
-   **/
-  def transferFile(infoIn:FTInfo):String = {  val (bool, appDataOpt) = app.transAllowFT(infoIn)
-                                              val info = updateInfo(infoIn, appDataOpt)
-                                              if(bool){
-                                                if(info.isInbound) actorSystem.actorOf(Props( new FileTransferIn(this, info)))
-                                                else               actorSystem.actorOf(Props( new FileTransferOut(this, info)))
-                                                ""
-                                              } else
-                                                "transAllowFT returned a False"
-                                            }
-  def start(connID:Int, msgID:Long, app:TransportApplication) = {
-    val conn = StartConn(connID, app)
-    startConn(name, conn, this, sendToApp = true)
-    toInAndOut(conn)
-    // Send msg back to the connecting task with the connID assigned
-    val msg = TMessage(trans = this, connID = connID, msgID = msgID, name = Transport.transConnectionCreated)
-    sendMessage(msg)
+  def sendMessage(msg:TransMessage):Boolean = {
+    traceProcess(this, TraceSend, msg)
+    if(msg.isValid){
+      if(bTransportTrace) debugTrace(s"TransSendOTW", msg, this)
+      while(sendMessageWillBlock) threadSleep(50)
+      if(bTransportSendMsg){
+        debug(s"SendMessage $transID/$channelID OTW: ${msg.toShort}")
+      }
+      outboundCnt.incrementAndGet             // Adjusted if msg must be auto-chunked
+      outboundData.addAndGet(msg.length)      // ditto
+      ttlMessages.incrementAndGet             // The global Transport message count
+      ttlData.incrementAndGet                 // The global Transport data in process amount
+      outbound ! msg
+      true
+    } else {
+      error(s"Transport.sendMessage -- Message not valid -- ${msg.toShort}")
+      false
+    }
   }
 
-  def close(connID:Int) = {
+  // Map of onFinish methods passed to the 'transferFile' method
+  private[jdctransport] val onFinishMap = new TrieMap[Long, (FTInfo) => Unit]
+
+  private val onFinishNoOp:(FTInfo) => Unit = (noop:FTInfo) => {}
+
+  /** Execute a File Transfer - Note: the transFTInboundPath and transFTInboundDone MUST be provided by the Application
+   *                                  on the inbound side of this transfer.
+   *  @param infoIn   - information about the transfer - msgID, connID<
+   *  @param onFinish - optional method which will be invoked when transfer is completed - either successfully or in error (check code)
+   *                    (The transFTStage method may also be overridden to detect the close of the transfer on either end, that
+   *                     will be called before onFinish)
+   *                    Note: Invoked on this end of the transfer regardless of whether a transfer in or out.
+   *
+   *  @return empty if OK, else an error message
+   **/
+  def transferFile(infoIn:FTInfo, onFinish:(FTInfo) => Unit = onFinishNoOp):String = {
+    val (bool, appDataOpt) = app.transAllowFT(infoIn)
+    val info = updateInfo(infoIn, appDataOpt)
+    if(bool){
+      if(! (onFinish eq onFinishNoOp)) onFinishMap += (info.infoKey -> onFinish)
+      if(info.isInbound) actorSystem.actorOf(Props( new FileTransferIn(this, info)))
+      else               actorSystem.actorOf(Props( new FileTransferOut(this, info)))
+      ""
+    } else {
+      val errMsg = "transAllowFT returned a False"
+      val err    = Error(connID = info.request.connID, msgID = info.xfrMsgID, errCode = ErrorCodes.notAllowed, errors = List(errMsg))
+      onFinish(info.copy(error = err))
+      errMsg
+    }
+  }
+  @volatile
+  private var started = false
+  /** In Publisher/Xchange usually called when a Socket.accept() is triggered.
+   *  ConnID is assigned, then this method called to respond to the connectee
+   *  with the TFConnCreated message
+   *  @param name - name desired by the caller to be assigned to the TMessage
+   *  @param data - data payload desired by the caller to be assigned to the TMessage
+   **/
+  def start(connID:Int, msgID:Long, app:TransportApplication, name:String = "", data:Array[Byte] = Array[Byte]()) =
+    if(!started){
+      started = true
+      val conn = StartConn(connID, app)
+      startConn(name, conn, this, sendToApp = true)
+      toInAndOut(conn)
+      if(connID != 0) {
+        connections += (connID -> (false, app))
+        // Send msg back to the connecting task with the connID assigned
+        val msg = TMessage(trans = this, connID = connID, msgID = msgID, flags = TFConnCreated.flag, name = name, data = data)
+        sendMessage(msg)
+      }
+    } else
+      warn(s"Ignoring start(...) call, already started: $toShort")
+
+  def wasStarted = started
+
+  /** Completely close down this Transport - all connIDs. ASSUMES complete shutdown */
+  def closeAll(clearOutQ:Boolean = true, ex:Option[Exception] = None) =
+        close(connIDAll, clearOutQ, andShutdown = true, ex)
+
+  /** Close down the given connID (or connIDAll) -- either process any pending outbound messages or clear them*/
+  def close(connID:Int, clearOutQ:Boolean = true, andShutdown:Boolean = false, ex:Option[Exception] = None) = {
     if (bTransportClose) debug(s"$name -- Closing ConnID: $connID")
-    val cls = Close(connID)
-    if (connID == connIDCloseAll) {
-      connections.foreach { case (connID, app) => app.transConnClose(connID, this) }
+    if(ex.nonEmpty)
+      error(s"Closing Transport $transID because of Exception: ${ex.get.toString}")
+    val cls = Close(connID, clearOutQ, andShutdown, if(ex.isEmpty) None else Some(ex.get.toString) )
+    if (connID == connIDAll) {
+      outbound ! cls
+      inbound  ! cls
+    } else connections.get(connID) match {
+      case None      => warn(f"Close for ConnID: ${connID}%,d, but not found -- ignored")
+      case Some((closed, app)) => if(closed==false) {
+                                    connections += (connID -> (true, app))
+                                    outbound ! cls
+                                  }
+    }
+  }
+  // Close down this Transport - will issue Close messages for ALL connIDs
+  def shutdownTrans(wait:Boolean = true): Unit = {
+    closeAll(clearOutQ=false, ex = None)
+    while( wait && !isClosed ) try{ Thread.sleep(100) } catch { case _:Exception => }
+    try {
       connections.clear
       actorSystem.stop(inbound)
       actorSystem.stop(outbound)
-    } else connections.get(connID) match {
-      case None      => warn(f"Close for ConnID: ${connID}%,d, but not found -- ignored")
-      case Some(app) => app.transConnClose(connID, this); connections -= connID
+      if(channel.isOpen) channel.close
+    } catch {
+      case _:Exception => // no-op -- ignore any errors
     }
   }
 
@@ -322,7 +457,6 @@ class Transport(val nameIn:String, val channel:SocketChannel, var app:TransportA
     outbound ! msg
   }
 }
-
 
 // Should never Thread.sleep within an Actor. This trait sends a message to the Actor after a given (increasing) delay
 trait DelayFor {
@@ -337,7 +471,7 @@ trait DelayFor {
 
   def delayFor(nextStep:TransportStep) = {
     implicit val ec = actorContext.system.dispatcher
-    lastDelay = if(lastDelay==0) actorSleepInitial else if(lastDelay * 2 >= actorSleepMax) actorSleepMax else lastDelay * 2
+    lastDelay = if(lastDelay<=0) actorSleepInitial else if( lastDelay >= actorSleepMax) actorSleepMax else lastDelay * 2
     delayCount += 1
     delayTotal += lastDelay
     if(nTransportSleep > 0){
@@ -361,6 +495,7 @@ trait SendMessageTrait extends DelayFor {
   def actorContext:ActorContext
   def actorSelf:ActorRef
   def trans:Transport
+  var info:FTInfo         // So we can update the # of segments and data sent
 
   // Logic - when the inFlight count is > maxInFlight, then enter backpressure mode and just queue all messages
   def minInFlight:Int     // 0 == no min, start sending again as soon as below maxInFlight
@@ -371,22 +506,29 @@ trait SendMessageTrait extends DelayFor {
   private var isInBackpressure = false
 
   // Queue of Message's to be sent. Messages added here if handling back-pressure
-  private val queue    = new ArrayDeque[TMessage]()
+  private val queue    = new ArrayDeque[TransMessage]()
 
-  private def addToQueue(msg:TMessage)  = queue.add(msg)
+  private def addToQueue(msg:TransMessage)  = queue.add(msg)
 
-  protected def internalSendMessage(msg:TMessage) = {
+  // If ftInfo.nonEmpty, then this came from a File Transfer
+  protected def internalSendMessage(msg:TransMessage, ftInfo:Option[FTInfo]) = {
     addToQueue(msg)
-    internalSendQueued
+    internalSendQueued(ftInfo)
   }
 
-  protected def internalSendQueued:Unit = {
+  // If ftInfo.nonEmpty, then this came from a File Transfer
+  protected def internalSendQueued(ftInfo:Option[FTInfo]):Unit = {
     // Send one message from the Q, and call again to check the next one
     def sendOne = if (!queue.isEmpty) {
                           val msg = queue.poll
                           trans.outbound ! msg
+
+                          if(msg.isFTSegment)
+                              info = info.copy(chunksSent = info.chunksSent + 1, totalData = info.totalData + msg.data.length)
+                          trans.app.transFTSent(trans, ftInfo.get, msg)
+
                           delayReset
-                          internalSendQueued
+                          internalSendQueued(ftInfo)
                         }
 
     // If have messages, check against any backpressure rules & send if OK
@@ -412,35 +554,42 @@ trait SendMessageTrait extends DelayFor {
 
   def sendQSize = queue.size
 }
-object Transport {
+object Transport extends JsonSupport {
   // INJECT methods for debug, info, warn, error messages - default is just print to the console
   var debug:(String) => Unit = (str:String)  => println(s"DEBUG: $str")
   var info:(String)  => Unit  = (str:String) => println(s" INFO: $str")
   var warn:(String)  => Unit  = (str:String) => println(s" WARN: $str")
   var error:(String) => Unit = (str:String)  => println(s"ERROR: $str")
 
-  private val transID = new AtomicInteger
+  // Assign a unique TransID and ChannelID within this JVM. Uses the same AtomicInteger, so will never be ==
+  // WARNING: Depends on a VAL transID and VAL channelID in Transport so only called once per Transport
+  private val transChnlID = new AtomicInteger
+  def assignTransID       = transChnlID.incrementAndGet
+  def assignChannelID     = transChnlID.incrementAndGet
 
-  def assignTransID = transID.incrementAndGet
+  val allTransports = new TrieMap[Int, Transport]         // ALL active Transport instances
+  val ttlMessages   = new AtomicLong()                    // Total TMessages in-process in all active Transports
+  val ttlData       = new AtomicLong()                    // Total data in-process in all active Transports
+
+  /** Create a Long key from a 'short' ID (e.g. connID) & msgID */
+  def makeKey(shortID:Int, msgID:Long):Long = if(shortID < maskShort)
+                                                ((shortID.toLong << shiftShort) | msgID)
+                                              else
+                                                throw new IllegalStateException(s"shortID must be 16-bit unsigned, had ${shortID}")
+
+  /** Parse a msgKey into the connID, msgID pieces --> (connID, msgID) */
+  def parseKey(key: Long): (Int, Long) = ((key >> shiftShort).toInt, (key & maskMsgID))
+
+  /** Parse a msgKey and return as a string of the form -- connID/msgId */
+  def parseKeyStr(key:Long):String = { val (connID, msgID) = parseKey(key); f"$connID/$msgID%,d" }
+
+  /** Create a key for the Redirect table */
+  def redirectKey(connID:Int, msgID:Long):Long = makeKey(connID, msgID)
 
   /** If one of the app calls returned a new FTAppData, update the FTInfo instance */
   def updateInfo(info:FTInfo, appDataOpt:Option[FTAppData]):FTInfo = if(appDataOpt.isEmpty) info else info.copy(appData = appDataOpt.get)
 
-  /** Assign a simple ID to a channel instead of the full identity hash code */
-  private val mapChannelID    = mutable.Map.empty[Int, Int]
-  private val channelIDAtomic = new AtomicInteger
-  // Assign a simple Channel ID within this JVM (just to not use identityHashCode directly)
-  def assignChannelID(channel:SocketChannel) = {
-    val ident = System.identityHashCode(channel)
-    mapChannelID.get(ident) match {
-      case None       => synchronized{
-                            val id = channelIDAtomic.incrementAndGet
-                            mapChannelID += (ident -> id)
-                            id
-                         }
-      case Some(id) => id
-    }
-  }
+
 
   /** Thread.sleep but just returns on an InterruptedException */
   def threadSleep(millis:Long) =  try{
@@ -459,12 +608,14 @@ object Transport {
   val sendMinDelay    = 8                 // Minimum delay in milliseconds -- used by DelayFor trait
   val sendMaxDelay    = 128               // Maximum delay in milliseconds
 
-  val connIDBroadcast= -2
-  val connIDCloseAll = -1
+  val connIDBroadcast= -2                 // Broadcast to all connIDs
+  val connIDAll      = -1                 // Some messages (e.g. Close) apply to ALL connIDs
+
   val connectionID   = new AtomicInteger    // Assignment of ConnectionIDs -- Server-side use only
 
-  val actorSleepInitial = 8        // If waiting to read/write channel, first sleep interval ... then double it - millis
-  val actorSleepMax     = 256      // ... until exceeds this max wait time
+  val actorSleepInitial = 8         // If waiting to read/write channel, first sleep interval ... then double it - millis
+  val actorSleepMax     = 256       // ... until exceeds this max wait time
+                                    // Note: SleepInitial & SleepMax should both be powers of 2 so lastDelay * 2 will == SleepMax
 
   val maxMessageSize    = 8 * 1024  // Larger messages must be 'chunked' into pieces
                                     // Size chosen to both reduce memory pressure and to prevent a large Message
@@ -490,14 +641,30 @@ object Transport {
   /** Test if ANY of the test flags is ON -- testFlags may also be a SINGLE flag */
   def flagsAny(flags:Long, testFlags:Long):Boolean= (flags & testFlags) > 0
 
-  val maxSzName     = 1023
-
-  val szNameShift   = 32 - 10           // Shift right to get szName to low-order bits
   val maskSzName    = 0x000003FF        // Mask to pick up the szName (after shift)
-  val maskFlags     = 0x00CFFFFF        // Mask to pick up the Flags
+  val maskFlags     = 0x003FFFFF        // Mask to pick up the Flags
   val maskByte      = 0x00FF
+  val keyHighBits   = 16
+  val shiftShort    = 64 - keyHighBits
   val maskShort     = 0x0000FFFF
+  val maskMsgID     = 0x0000FFFFFFFFFFFFL
   val maskInt       = 0x00FFFFFFFFL
+
+  val maxSzName     = Int.MaxValue & maskSzName
+  val maxFlagValue  = Int.MaxValue & maskFlags
+
+  val bitsInSzName  = java.lang.Integer.bitCount(maskSzName)
+  val bitsInFlags   = java.lang.Integer.bitCount(maskFlags)
+
+  val szNameShift   = 32 - bitsInSzName // Shift a LONG right to get szName to low-order bits
+
+  val bitCountOK    = if(bitsInSzName + bitsInFlags != 32 ||
+                        ( (maskSzName.toLong << szNameShift) & maskFlags.toLong) > 0 ||   // Overlap
+                        ( (maskSzName<<szNameShift) >>> szNameShift != maskSzName) ){        // lose bits
+                        throw new IllegalStateException("maskSzName and/or maskFlags is screwed up ")
+                        false
+                      } else
+                        true
 
   // Size & Offsets, etc to various fields within the on-the-wire buffer
   val szLength      = 4
@@ -525,70 +692,200 @@ object Transport {
   // Max allowed 'data' array if the 'name' field is empty (size of 0)
   val maxDataIfNoName        = maxData(0)
 
-  // These messages are handled by the Transport system itself. There is no security and/or login involved, the
-  // application can require login messages (handled by the application) if desired.
-  // These names are specialized and should not be used by any other part of the application
-  val transConnectionCreated  = "##ConnectionCreated$$"    // Connection ID is in the Message header
-  val transFTStart            = "##FileTransferStart$$"
-  val transFTReady            = "##FileTransferReady$$"
-  val transFTStop             = "##FileTransferStop$$"
-  val transFTRefused          = "##FileTransferRefused$$"
-
   /** One of the actors got a StartConn message - update the given Map in place
    *  and (optionally) send an AppConnect message to the Application
    **/
   def startConn(label:String, conn:StartConn, trans:Transport, sendToApp:Boolean = false) = {
-    if (bTransportOpen) debug(s"$label ${conn.toShort}")
+    if (bTransportOpen) debug(s"$label STARTING ${conn.toShort}")
     trans.connections.get(conn.connID) match {
-      case None      => trans.connections += (conn.connID -> conn.app)
-      case Some(ref) => if (ref != conn.app) {    // If ==, have a dup message so just ignore
-                          warn(f"$label -- ConnID: ${conn.connID}%,d was already defined -- changing Application reference")
-                          trans.connections += (conn.connID -> conn.app)
-                        }
+      case None      => trans.connections += (conn.connID -> (false, conn.app))
+      case Some((closed, ref)) => if (ref != conn.app) {    // If ==, have a dup message so just ignore
+                                    warn(f"$label -- ConnID: ${conn.connID}%,d was already defined -- changing Application reference")
+                                    trans.connections += (conn.connID -> (false, conn.app) )
+                                  }
     }
     if(sendToApp) conn.app.transConnOpen(conn.connID, trans)
   }
 
-  // Debug flags - if bTransport == false, then ALL are disabled
-  // NOTE: final val ==> the compiler will not even generate code into the .class file for any
-  //       statement of the form if(flag){ .... }.
-  //
-  //       Change 'final val' to 'var' if you want to change these dynamically at runtime.
-  final val bTransport         = true
+  lazy val transBrkDummy = new AtomicInteger()
+
+  def transBrk(name:String) = {
+    if(bTransportBrkPt) {
+      if(lstTransBreakpoint.contains("*") || lstTransBreakpoint.contains(name)){
+        // Set the breakpoint here!!!!
+        transBrkDummy.incrementAndGet     // Only so JIT compiler doesn't decide to eliminate transBrk completely
+      }
+    }
+  }
+  /************************************************************************************************/
+  /** Injection of message trace/modify functions IFF caller desires                              */
+  /**                                                                                             */
+  /** The intent is to allow an application to establish tracing or modification of messages at   */
+  /** key points external to this Transport system, with minimal modification to the application  */
+  /** code itself.                                                                                */
+  /**                                                                                             */
+  /** WARNING: Each TraceMethod is normally expected to issue debug traces of message activity,   */
+  /**          BUT the returned TransMessage will then be passed along the list and eventually    */
+  /**          for transport (if sendMessage was called) or to the application (before calling    */
+  /**          TransportApplication.transMsgReceived) so a TraceMethod may in face MODIFY the     */
+  /**          message. Use carefully!                                                            */
+  /************************************************************************************************/
+
+  /** A TraceMethod will be invoked at the appropriat point. It is passed:
+   *   -- Int         - the unique ID assigned internally to this TraceMethod when it is add'ed
+   *   -- TracePoint  - the point at which it is being invoked
+   *   -- Transport   - the Transport involved
+   *   -- TransMessage- the message involved.
+   *
+   * RETURN: Usually the original TransMessage, but it may (carefully!) be modified if desired
+   **/
+  type TraceMethod = (Int, TracePoint, Transport, TransMessage) => TransMessage
+
+  private var traceNextID = new AtomicInteger(0)
+  // All registered TraceMethod functions
+  private var traceList:List[(Int, TracePoint, TraceMethod)] = Nil
+
+  private[jdctransport] def traceProcess(trans:Transport, forPoint:TracePoint, msg:TransMessage):TransMessage = {
+    if(traceList.isEmpty)
+      msg
+    else {
+      var result = msg
+      traceList.view
+               .filter { case(_, point, _) => point.is(forPoint) }
+               .foreach{ case(id, _, func) => result = func(id, forPoint, trans, result)}
+      result
+    }
+  }
+  /** Add a TraceMethod to the list of trace methods to be invoked
+   *
+   * @param forPoint  - when this traceFunc should be invoked: for sends, receives, always, etc
+   * @param traceFunc - the function to be executed
+   * @return          - the internal ID assigned to this entry (needed for traceDrop)
+   */
+  def traceAdd(forPoint:TracePoint, traceFunc:TraceMethod):Int = synchronized{ val id = traceNextID.incrementAndGet; traceList +:= (id, forPoint, traceFunc); id }
+  /** Drop the TraceMethod with the given ID from the active trace list */
+  def traceDrop(id:Int) = synchronized{ traceList = traceList.filterNot( _._1 == id )}
+
+  /** ByteBuffer position(n) + other routines will abort when running on Java version < 9 if compiled by 9 or higher
+   *  Calling these methods skirt that problem.
+   *  see:     https://www.morling.dev/blog/bytebuffer-and-the-dreaded-nosuchmethoderror/
+   *           https://github.com/apache/felix/pull/114
+   */
+  def bbPosition(bb: ByteBuffer, n: Int): ByteBuffer = bb.asInstanceOf[Buffer].position(n).asInstanceOf[ByteBuffer]
+
+  def bbLimit(bb: ByteBuffer, n: Int): ByteBuffer = bb.asInstanceOf[Buffer].limit(n).asInstanceOf[ByteBuffer]
+  
+  /************************************************************************************************/
+  /** Internal debug flags - require a rebuild of jdctransport to take effect                     */
+  /**                                                                                             */
+  /** Notes: -- the 'final val' allows the compiler to not even generate code for any section of  */
+  /**           the form:  if(flag){.....} if 'flag' is false                                     */
+  /**        -- generally structured in logical sections:                                         */
+  /**             bTransport -- the MASTER, if 'false' then all other flags are also 'false'      */
+  /**             See: bTransportApp -- serves as a sub-master to control a section of flags      */
+  /**                                                                                             */
+  /************************************************************************************************/
+  final val bTransport         = false
+  final val bInboundFunc       = bTransport && false  // run inboundTest on each msg & if true call inboundFunc
+                                                      // Can just print it, set a breakpoint, change the func, etc
+  var inboundTest = (msg:TransMessage) => { false }   // change to pick out messages of interest, default to 'false'
+  var inboundFunc = (msg:TransMessage) => {           // and if TRUE, then execute this function
+    println(s" INBOUND: ${msg.toShort}")
+  }
+  final val bOutboundFunc      = bTransport && false  // Ditto for outbound messages
+  var outboundTest = (msg:TransMessage) => false
+  var outboundFunc = (msg:TransMessage) => {
+    println(s"OUTBOUND: ${msg.toShort}")
+
+  }
+  final val bTransportTrace    = bTransport && false
+  final val lstTraceMsgs       = List.empty[String]
+
+  final val bTransportBrkPt    = bTransport && false           // Allow setting a breakpoint on transBrk()
+  final val lstTransBreakpoint = List.empty[String]        // ... but only for these message names (* == all messages)
+
   // Debug when one of the TransportApplication methods is called
-  final val bTransportApp      = bTransport && true
-  final val bAppReceived       = bTransportApp && true
-  final val bAppSent           = bTransportApp && true
-  final val bAppConnOpen       = bTransportApp && true
-  final val bAppConnClose      = bTransportApp && true
+  final val bTransportApp      = bTransport && false
+  final val bAppReceived       = bTransportApp && false
+  final val bAppSent           = bTransportApp && false
+  final val bAppConnOpen       = bTransportApp && false
+  final val bAppConnClose      = bTransportApp && false
 
-  final val bTransportSetup    = bTransport && true
-  final val bTransportOpen     = bTransport && true
+  final val bTransportOpen     = bTransport && false           // Startup of Transport & all Actors
   final val bTransportClose    = bTransport && false
-  final val bTransportActor    = bTransport && true
-  final val bTransportOutbound = bTransport && true
-  final val bTransportOutDtl   = bTransport && true
-  final val bTransportInbound  = bTransport && true
-  final val bTransportInDtl    = bTransport && true
-  final val bTransportDeChunk  = bTransport && true
-  final val bTransportDoChunk  = bTransport && true
-  final val bTransportSegment  = bTransport && true
-  final val bTransportRdCycle  = bTransport && true
+  final val bTransportActorID  = bTransport && false
+  final val bTransportSendMsg  = bTransport && false
+  final val bTransportOutbound = bTransport && false
+  final val bTransportOutDtl   = bTransport && false
+  final val bTransportInbound  = bTransport && false
+  final val bTransportInDtl    = bTransport && false
+  final val bTransportDeChunk  = bTransport && false
+  final val bTransportDoChunk  = bTransport && false
+  final val bTransportSegment  = bTransport && false
+  final val bTransportRdCycle  = bTransport && false
   final val bTransportBfrExpand= bTransport && false
-  final val bTransportRedirect = bTransport && true
-  final val bTransportOTW      = bTransport && true
+  final val bTransportRedirect = bTransport && false
+  final val bTransportOTW      = bTransport && false
 
-  final val bFileTransfer      = bTransport && true
+  final val bTransportDelayIn  = bTransport && false         // Insert artificial delay on INBOUND processing
+  final val nTransportDelayIn  = 5000                       // IFF bTransportDelayIn, number of millis to delay
+
+  final val bFileTransfer      = bTransport && false
   final val bFTIn              = bFileTransfer
-  final val bFTInReceive       = bFileTransfer && true
-  final val bFTInMsg           = bFTIn && true
+  final val bFTInReceive       = bFileTransfer && false
+  final val bFTInMsg           = bFTIn && false
 
   final val bFTOut             = bFileTransfer
-  final val bFTOutReceive      = bFTOut && true
-  final val bFTOutMsg          = bFTOut && true
+  final val bFTOutReceive      = bFTOut && false
+  final val bFTOutMsg          = bFTOut && false
 
 
   final val nNullWriteCycles   = if(bTransport) 500 else 0
   final val nEmptyReadCycles   = if(bTransport) 20 else 0
   final val nTransportSleep    = if(bTransport) 0 else 0
+
+  // Some column widths to attempt to line up the information in the log lines
+  val szTrcLabel = 60
+  val szTrcTrans = 60
+  val traceMarker= "*" * 4 + "--> "
+  /**
+   * Log a particular set of messages (by name) -- NOTE: Similar method also exists in Transport!
+   * @param label - label to indicate where log originated (e.g. TransportOutActor in Transport layer)
+   * @param msg   - the message being processed
+   * @param trans - if non-null, ID info will be included in log msg
+   * @param msgs  - list of messages to be traced
+   */
+  def debugTrace(label:String, msg:TransMessage, trans:Transport = null, msgsToTrace:List[String] = lstTraceMsgs) = {
+    def padTo(str:String, n:Int) = if(str.length >= n) str else str + " " * (n - str.length)
+    if(bTransportTrace) {
+      if(msgsToTrace.nonEmpty) {
+        val szTrcName = msgsToTrace.map(_.length).max
+        val name = msg.name
+        if (msgsToTrace.contains(name)) {
+          val transStr = if (trans != null) s"${trans.transID}/${System.identityHashCode(trans.channel)}" else "(NoTrans)"
+          debug(s"$traceMarker${padTo(name, szTrcName)} ${padTo(label, szTrcLabel)} ${padTo(transStr, szTrcTrans)} ${msg.toShort}")
+        }
+      }
+    }
+  }
+}
+
+/** Define at which point various registered TraceMethod's will be invoked */
+sealed trait TracePoint extends JDCFlagsCodes {
+  val bitFlags    = true
+  val allActive   = List(TraceSend, TraceSent, TraceRcv, TraceSendRcv, TraceFT)
+  val allExtended = allActive
+  override val allExcluded = List(TraceNone, TraceAll)
+}
+case object TraceNone    extends TracePoint { val value = 0;                                lazy val name = "TraceNone";     lazy val description = "Trace NONE"}
+case object TraceSend    extends TracePoint { val value = 0x01 << 1;                        lazy val name = "TraceSend";     lazy val description = "Invoke when Transport.sendMessage is called"}
+case object TraceSent    extends TracePoint { val value = 0x01 << 2;                        lazy val name = "TraceSent";     lazy val description = "Invoke when the message is actually sent to the Socket"}
+case object TraceRcv     extends TracePoint { val value = 0x01 << 3;                        lazy val name = "TraceRcv";      lazy val description = "Invoke just before calling TransportApplication.transMsgReceived"}
+case object TraceSendRcv extends TracePoint { val value = TraceSend.value + TraceRcv.value; lazy val name = "TraceSendRcv";  lazy val description = "Invoke on either a Send or Rcv"}
+case object TraceFT      extends TracePoint { val value = 0x01 << 4;                        lazy val name = "TraceFT";       lazy val description = "Invoke on File Transfers" }
+case object TraceAll     extends TracePoint { val value = 0xFF;                             lazy val name = "TraceAll";      lazy val description = "Invoke TraceMethod for all TracePoints"}
+
+trait TransActor extends Actor {
+  def trans:Transport
+  val ident = { if(Transport.bTransportActorID) Transport.debug(s"ACTOR ${this.getClass.getName} has ActorRef: $self"); 0}
 }

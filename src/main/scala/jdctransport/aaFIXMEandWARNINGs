@@ -1,0 +1,19 @@
+WARNINGs
+--------
+If compiled with Java 9 or above, get: java.lang.NoSuchMethodError: java.nio.ByteBuffer.position(I)Ljava/nio/ByteBuffer;
+See this writeup: https://www.morling.dev/blog/bytebuffer-and-the-dreaded-nosuchmethoderror/
+
+NOTE: the --release=8 settings in IntelliJ did not seem to solve the problem. Finally had to execute under Java 17
+FIXMEs
+------
+-- define a stop() method which will shut down a Transport
+  -- remove from active list
+  -- terminate all of the actors
+  -- call the transIsStopping method of the Application (in the trait)
+-- define a TransportThrottle(set:Boolean) method to Transport itself
+  -- can be sent by other party (e.g. SDMXchange server) as backpressure
+  -- True == set a flag, block on all sendMessage calls
+  -- false == unset the flag
+?? Make the backpressureHigh/Low settings vars & allow TransportThrottle to modify???
+
+-- In FileTransfer did not test the isGrowing logic AT ALL
